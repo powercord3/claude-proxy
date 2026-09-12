@@ -443,6 +443,39 @@ export function toResponsesInput(
   return out;
 }
 
+export type ResponsesInputs = {
+  /** For the HTTPS path: trailing developer messages moved after the last actionable item. */
+  httpInput: ResponseItem[];
+  /** For the WS delta path: raw, unreordered -- append-only turn over turn. */
+  wsInput: ResponseItem[];
+};
+
+/**
+ * The one place that decides whether a Codex request's `input` gets the trailing-developer
+ * reorder. Fix B (dominant cause of the WS delta transport falling back to a full resend on 91%
+ * of production requests): normalizeMessagesForResponses's reorder is defined relative to the
+ * END of a growing conversation, so an item's position shifts turn over turn, and a permuted
+ * history can never be a strict prefix of what codex-ws.ts recorded as a session's baseline. The
+ * HTTPS path re-uploads the whole transcript every turn regardless (`store:false`) and can
+ * afford the reorder for prompt-cache-key stability; the WS path cannot, and must see the RAW,
+ * unreordered messages instead -- developer/system-reminder messages are replayed in full every
+ * turn regardless, so the raw list is already append-only and stable without needing the reorder
+ * at all.
+ *
+ * Both fields are consumed at the one call site in chatCodexOAuthInner, so reverting this choice
+ * means changing this function rather than an inline expression a future edit can silently drop.
+ */
+export function buildResponsesInputs(
+  messages: AnthropicMessage[],
+  cachedReasoning: ResponseItem[],
+): ResponsesInputs {
+  const reordered = normalizeMessagesForResponses(messages);
+  return {
+    httpInput: toResponsesInput(reordered, cachedReasoning),
+    wsInput: toResponsesInput(messages, []),
+  };
+}
+
 // ── Reasoning effort mapping ─────────────────────────────────────────
 
 function reasoningEffort(level?: ReasoningLevel): "low" | "medium" | "high" | "xhigh" | "max" {
@@ -953,14 +986,17 @@ async function chatCodexOAuthInner(
     ? []
     : (reasoningItemsByKey(reasoningLookupKey) as ResponseItem[]);
 
-  const input = toResponsesInput(messages, cachedReasoning);
   // The WebSocket transport carries the previous turn's chain of thought in the server's own
   // connection-local state, so the local encrypted-reasoning cache must NOT be spliced into
   // anything sent there. Two reasons, and the second is the load-bearing one. The server
   // already has it, so re-sending is waste; and the delta calculation in codex-ws.ts compares
   // this turn's items against what was sent last turn, which only lines up if neither array
   // carries an item the client would never echo back. See the Baseline note in that file.
-  const inputForWs = cachedReasoning.length ? toResponsesInput(messages, []) : input;
+  //
+  // Fix B (dominant cause, 91% of requests): see buildResponsesInputs's doc comment. `input`
+  // still goes through the reordered messages exactly as before; `inputForWs` is now built by
+  // the same function that builds `input`, so the two can never drift apart again silently.
+  const { httpInput: input, wsInput: inputForWs } = buildResponsesInputs(body.messages, cachedReasoning);
   const tools = toResponsesTools(body.tools);
   const verbosity = textVerbosity();
   const summary = reasoningSummary();

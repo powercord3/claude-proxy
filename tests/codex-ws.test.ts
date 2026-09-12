@@ -5,7 +5,13 @@ import {
   resetCodexWsForTests,
   codexWsStatus,
 } from "../adapters/providers/codex-ws.js";
+import {
+  normalizeMessagesForResponses,
+  toResponsesInput,
+  buildResponsesInputs,
+} from "../adapters/providers/codex-oauth.js";
 import type { ResponseItem } from "../adapters/providers/codex-oauth.js";
+import type { AnthropicMessage } from "../adapters/types.js";
 
 // ── Fake socket ──────────────────────────────────────────────────────────────
 //
@@ -21,18 +27,26 @@ let sentPayloads: Record<string, unknown>[] = [];
 let script: Script;
 let connectBehaviour: "open" | "fail" = "open";
 let socketsOpened = 0;
+// What the fake socket hands `onerror` when `connectBehaviour === "fail"`. Overridden per test
+// to exercise describeSocketError's mining of `.error`/`.error.cause`; defaults to the shape
+// most existing tests rely on (a plain `.message`, no `.error` at all).
+let failEvent: { message?: string; error?: unknown } = { message: "refused" };
+// The most recently constructed socket, so a test can fire onerror/onclose directly on it mid-
+// turn -- rather than through `script`, which only ever drives `onmessage`.
+let lastSocket: FakeSocket | null = null;
 
 class FakeSocket {
   onopen: (() => void) | null = null;
   onmessage: ((ev: { data: string }) => void) | null = null;
-  onerror: ((ev: { message?: string }) => void) | null = null;
+  onerror: ((ev: { message?: string; error?: unknown }) => void) | null = null;
   onclose: ((ev: { code: number; reason: string }) => void) | null = null;
   closed = false;
 
   constructor(_url: string, _opts?: { headers?: Record<string, string> }) {
     socketsOpened += 1;
+    lastSocket = this;
     queueMicrotask(() => {
-      if (connectBehaviour === "fail") this.onerror?.({ message: "refused" });
+      if (connectBehaviour === "fail") this.onerror?.(failEvent);
       else this.onopen?.();
     });
   }
@@ -53,6 +67,8 @@ beforeEach(() => {
   sentPayloads = [];
   socketsOpened = 0;
   connectBehaviour = "open";
+  failEvent = { message: "refused" };
+  lastSocket = null;
   delete process.env.CCX_CODEX_WS;
   resetCodexWsForTests();
 });
@@ -216,6 +232,230 @@ describe("incremental continuation", () => {
   });
 });
 
+// ── Fix C: server echo must be canonicalized the way the client will rebuild it ──────────────
+
+describe("Fix C: server echo canonicalization", () => {
+  it("groups a turn's interleaved text and tool calls into one message plus trailing calls, matching the client's rebuild", async () => {
+    script = (_s, reply) => {
+      reply({ type: "response.created", response: { id: "resp-1" } });
+      reply({
+        type: "response.output_item.done",
+        item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "First." }] },
+      });
+      reply({
+        type: "response.output_item.done",
+        item: { type: "function_call", call_id: "call-1", name: "read_file", arguments: "{}" },
+      });
+      reply({
+        type: "response.output_item.done",
+        item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "Second." }] },
+      });
+      reply({
+        type: "response.output_item.done",
+        item: { type: "function_call", call_id: "call-2", name: "read_file", arguments: "{}" },
+      });
+      reply({ type: "response.completed", response: { id: "resp-1", usage: {} } });
+    };
+    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("go")], headers: {} }))!);
+
+    // What Claude Code actually replays next turn: ALL text from the turn joined into ONE
+    // message, THEN both tool calls -- never the interleaved shape the server streamed it in.
+    const assistantTurn: ResponseItem = {
+      type: "message",
+      role: "assistant",
+      content: [{ type: "output_text", text: "First.Second." }],
+    } as unknown as ResponseItem;
+    script = (_s, reply) => {
+      reply({ type: "response.created", response: { id: "resp-2" } });
+      reply({ type: "response.completed", response: { id: "resp-2", usage: {} } });
+    };
+    const t2 = await runCodexWsTurn({
+      shellBody: SHELL,
+      input: [userMsg("go"), assistantTurn, fnCall("call-1"), fnCall("call-2"), userMsg("thanks")],
+      headers: {},
+    });
+    await drain(t2!);
+
+    expect(t2!.incremental).toBe(true);
+    expect(sentPayloads[1].input).toEqual([
+      { type: "message", role: "user", content: [{ type: "input_text", text: "thanks" }] },
+    ]);
+  });
+
+  it("matches a function_call whose arguments differ only in whitespace from the client's re-serialization", async () => {
+    script = (_s, reply) => {
+      reply({ type: "response.created", response: { id: "resp-1" } });
+      reply({
+        type: "response.output_item.done",
+        // The server's own spacing -- a space after the colon.
+        item: { type: "function_call", call_id: "call-1", name: "read_file", arguments: '{"path": "/a"}' },
+      });
+      reply({ type: "response.completed", response: { id: "resp-1", usage: {} } });
+    };
+    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("go")], headers: {} }))!);
+
+    script = toolCallScript("resp-2", "call-2");
+    const t2 = await runCodexWsTurn({
+      shellBody: SHELL,
+      // Claude Code round-trips the call through a parsed object and JSON.stringify's it back
+      // out compactly -- no space after the colon -- even though the server sent one.
+      input: [userMsg("go"), fnCall("call-1", '{"path":"/a"}'), fnOut("call-1", "contents")],
+      headers: {},
+    });
+    await drain(t2!);
+
+    expect(t2!.incremental).toBe(true);
+    expect(sentPayloads[1].input).toEqual([
+      { type: "function_call_output", call_id: "call-1", output: "contents" },
+    ]);
+  });
+});
+
+// ── Fix B: the WS path must not use the trailing-developer-reordered message list ────────────
+
+describe("Fix B: trailing developer messages must not need history to reorder for the WS path", () => {
+  // codex-oauth.ts builds the WS turn's `input` as `toResponsesInput(body.messages, [])` -- the
+  // RAW, unreordered message list -- specifically so a trailing system-reminder/developer
+  // message, replayed every turn, never shifts an earlier item's position. This test reproduces
+  // that exact expression rather than driving codex-oauth.ts's chatCodexOAuthInner directly,
+  // since that needs a live OAuth token and an upstream network call this suite must not make;
+  // it exercises the real matching mechanism in codex-ws.ts end to end, and the contrasting test
+  // below shows the SAME conversation would have gone full-resend under the pre-fix (reordered)
+  // formula -- the exact divergence that made 1,993/2,043 production turns fall back to a full
+  // resend. It does not, on its own, catch a regression that reverts the one-line wiring choice
+  // in codex-oauth.ts itself; see the PR report.
+  const msgs1: AnthropicMessage[] = [
+    { role: "user", content: "u1" },
+    { role: "developer", content: "d1" },
+  ];
+  const msgs2: AnthropicMessage[] = [
+    { role: "user", content: "u1" },
+    { role: "developer", content: "d1" },
+    { role: "assistant", content: "ok" },
+    { role: "user", content: "u2" },
+    { role: "developer", content: "d2" },
+  ];
+
+  it("stays incremental on turn 2 despite a trailing developer message appended each turn", async () => {
+    script = (_s, reply) => {
+      reply({ type: "response.created", response: { id: "resp-1" } });
+      reply({
+        type: "response.output_item.done",
+        item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] },
+      });
+      reply({ type: "response.completed", response: { id: "resp-1", usage: {} } });
+    };
+    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: toResponsesInput(msgs1, []), headers: {} });
+    await drain(t1!);
+
+    script = toolCallScript("resp-2", "call-2");
+    const t2 = await runCodexWsTurn({ shellBody: SHELL, input: toResponsesInput(msgs2, []), headers: {} });
+    await drain(t2!);
+
+    expect(t2!.incremental).toBe(true);
+    expect(sentPayloads[1].previous_response_id).toBe("resp-1");
+    expect(sentPayloads[1].input).toEqual(toResponsesInput(msgs2, []).slice(3));
+  });
+
+  it("contrast: the pre-fix reordered input for the SAME conversation is not resumable", async () => {
+    script = (_s, reply) => {
+      reply({ type: "response.created", response: { id: "resp-1" } });
+      reply({
+        type: "response.output_item.done",
+        item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] },
+      });
+      reply({ type: "response.completed", response: { id: "resp-1", usage: {} } });
+    };
+    const t1 = await runCodexWsTurn({
+      shellBody: SHELL,
+      input: toResponsesInput(normalizeMessagesForResponses(msgs1), []),
+      headers: {},
+    });
+    await drain(t1!);
+
+    script = toolCallScript("resp-2", "call-2");
+    const t2 = await runCodexWsTurn({
+      shellBody: SHELL,
+      input: toResponsesInput(normalizeMessagesForResponses(msgs2), []),
+      headers: {},
+    });
+    await drain(t2!);
+
+    // The reorder is relative to the END of the array, so "u1"'s position moves between turn 1
+    // (nothing trails it) and turn 2 (both "u2" and "d2" trail it) -- a permuted history can
+    // never be a strict prefix of what codex-ws.ts recorded as the baseline.
+    expect(t2!.incremental).toBe(false);
+  });
+});
+
+// ── Fix B regression: buildResponsesInputs is the only place the choice is made ──────────────
+//
+// The two tests above duplicate `toResponsesInput(body.messages, [])` inline, which cannot catch
+// a revert of the one-line wiring choice in codex-oauth.ts's call site -- reported as an open gap
+// in the original PR. `buildResponsesInputs` closes it: it is the actual exported function that
+// call site now imports and uses for BOTH `httpInput` and `wsInput`, so this drives production
+// code directly rather than a copy of its formula.
+
+describe("Fix B regression: buildResponsesInputs is the one place httpInput/wsInput are chosen", () => {
+  it("reorders httpInput but leaves wsInput in raw order for a body ending in a trailing developer message", () => {
+    const messages: AnthropicMessage[] = [
+      { role: "user", content: "u1" },
+      { role: "assistant", content: [{ type: "tool_use", id: "call-1", name: "read_file", input: {} }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "out1" }] },
+      { role: "developer", content: "reminder" },
+    ];
+
+    const { httpInput, wsInput } = buildResponsesInputs(messages, []);
+
+    // HTTPS path: the reorder still applies -- the trailing developer message stays trailing and
+    // the tool_result (the last actionable item) moves to sit after it. This guards the HTTPS
+    // path against a regression in the OTHER direction (accidentally routing it through
+    // buildResponsesInputs's WS branch).
+    expect(httpInput).toEqual(toResponsesInput(normalizeMessagesForResponses(messages), []));
+    expect(httpInput.at(-1)).toEqual({ type: "function_call_output", call_id: "call-1", output: "out1" });
+
+    // WS path: raw, append-only order -- the developer message trails, nothing moved.
+    expect(wsInput).toEqual(toResponsesInput(messages, []));
+    expect(wsInput.at(-1)).toEqual({
+      type: "message",
+      role: "developer",
+      content: [{ type: "input_text", text: "reminder" }],
+    });
+  });
+
+  it("keeps every turn's wsInput a strict prefix of the next turn's across a growing conversation with a new trailing developer message every turn", () => {
+    // Mirrors what Claude Code actually replays: the full transcript so far, PLUS this turn's
+    // tool call, tool result, and a fresh system-reminder developer message on the tail --
+    // matching the production measurement that developer/system-reminder messages are replayed
+    // in full every turn, one new one arriving on each.
+    let messages: AnthropicMessage[] = [{ role: "user", content: "start the task" }];
+    const wsInputCanonsByTurn: string[][] = [];
+
+    for (let turn = 1; turn <= 6; turn++) {
+      const { wsInput } = buildResponsesInputs(messages, []);
+      wsInputCanonsByTurn.push(wsInput.map((item) => JSON.stringify(item)));
+
+      messages = [
+        ...messages,
+        { role: "assistant", content: [{ type: "tool_use", id: `call-${turn}`, name: "read_file", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: `call-${turn}`, content: `out${turn}` }] },
+        { role: "developer", content: `reminder-${turn}` },
+      ];
+    }
+
+    for (let i = 0; i < wsInputCanonsByTurn.length - 1; i++) {
+      const prev = wsInputCanonsByTurn[i];
+      const next = wsInputCanonsByTurn[i + 1];
+      // Load-bearing: this is exactly the property codex-ws.ts's findResumable needs to hold in
+      // order to send a delta instead of a full resend. Reverting buildResponsesInputs to route
+      // wsInput through the reordered messages breaks it, because the reorder is defined
+      // relative to the END of the array and a new developer message lands on the tail turn.
+      expect(next.length).toBeGreaterThan(prev.length);
+      expect(next.slice(0, prev.length)).toEqual(prev);
+    }
+  });
+});
+
 // ── The cases where continuing would be wrong ────────────────────────────────
 
 describe("refuses to continue a chain it cannot prove", () => {
@@ -259,7 +499,11 @@ describe("refuses to continue a chain it cannot prove", () => {
   it("abandons the chain after a server item it cannot model as a client echo", async () => {
     script = (_s, reply) => {
       reply({ type: "response.created", response: { id: "resp-1" } });
-      reply({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws_1" } });
+      // A genuinely unknown future item type -- NOT web_search_call, which Fix D below moves to
+      // "skip" (absent from the baseline, chain preserved) rather than "unmodelled". This must
+      // stay some type classifyOutputItem has never heard of, so it keeps exercising the
+      // conservative default.
+      reply({ type: "response.output_item.done", item: { type: "some_future_tool_call", id: "x_1" } });
       reply({ type: "response.completed", response: { id: "resp-1", usage: {} } });
     };
     await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("search")], headers: {} }))!);
@@ -276,6 +520,31 @@ describe("refuses to continue a chain it cannot prove", () => {
     // not match. A full resend is the correct, merely-expensive answer.
     expect(t2!.incremental).toBe(false);
     expect(sentPayloads[1].previous_response_id).toBeUndefined();
+  });
+
+  it("Fix D: a web_search_call does not invalidate the baseline -- the next turn is still incremental", async () => {
+    script = (_s, reply) => {
+      reply({ type: "response.created", response: { id: "resp-1" } });
+      reply({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws_1" } });
+      reply({ type: "response.completed", response: { id: "resp-1", usage: {} } });
+    };
+    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("search")], headers: {} }))!);
+
+    script = toolCallScript("resp-2", "call-2");
+    const t2 = await runCodexWsTurn({
+      shellBody: SHELL,
+      input: [userMsg("search"), userMsg("again")],
+      headers: {},
+    });
+    await drain(t2!);
+
+    // The client never echoes a web_search_call back (same as reasoning), so the baseline from
+    // turn 1 is just [userMsg("search")] and turn 2 sends only the new item as a delta.
+    expect(t2!.incremental).toBe(true);
+    expect(sentPayloads[1].previous_response_id).toBe("resp-1");
+    expect(sentPayloads[1].input).toEqual([
+      { type: "message", role: "user", content: [{ type: "input_text", text: "again" }] },
+    ]);
   });
 
   it("does not commit a baseline when the turn never completed", async () => {
@@ -308,10 +577,14 @@ describe("falls back to HTTPS rather than failing a request", () => {
     expect(socketsOpened).toBe(1);
   });
 
-  it("returns null on an error frame that arrives before any response content", async () => {
-    script = (_s, reply) => reply({ type: "error", status: 400, error: { message: "nope" } });
+  it("returns null on an error frame that arrives before any response content, and disables the transport (genuine fault)", async () => {
+    // No structured `type`/`code`, and the message names nothing Fix A recognises as an
+    // ordinary upstream refusal -- this must fall through to disabling the transport exactly as
+    // before, not just fail this one turn over.
+    script = (_s, reply) => reply({ type: "error", status: 500, error: { message: "internal server hiccup" } });
     const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
     expect(turn).toBeNull();
+    expect(codexWsStatus().enabled).toBe(false);
   });
 
   it("keeps the transport armed when the failure is only an expired chain", async () => {
@@ -334,6 +607,49 @@ describe("falls back to HTTPS rather than failing a request", () => {
     const t3 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("fresh")], headers: {} });
     expect(t3).not.toBeNull();
     await drain(t3!);
+  });
+
+  it("Fix A: fails a turn over to HTTPS on the real usage_limit_reached frame recovered from the production log, but leaves the transport ENABLED", async () => {
+    // Verbatim from the production log (the proximate cause of 1,993/2,043 turns re-uploading
+    // the full transcript): the old `disableTransport` branch matched on the raw frame text
+    // rather than the structured `error.type` field, so this ordinary ChatGPT-plan quota refusal
+    // killed the websocket for the rest of the process. `headers` in the recovered log line was
+    // truncated (`{...}`); the exact header keys are not load-bearing here, so it is reproduced
+    // as an empty object rather than guessed at.
+    script = (_s, reply) =>
+      reply({
+        type: "error",
+        error: {
+          type: "usage_limit_reached",
+          message: "The usage limit has been reached",
+          plan_type: "plus",
+          resets_at: 1788984352,
+          eligible_promo: null,
+          resets_in_seconds: 16584,
+        },
+        status_code: 429,
+        headers: {},
+      });
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    expect(turn).toBeNull();
+    // Assert the REASON the turn failed over, not merely that it did: the transport must still
+    // be armed for the very next turn.
+    expect(codexWsStatus().enabled).toBe(true);
+
+    script = toolCallScript("resp-9", "call-9");
+    const again = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("fresh")], headers: {} });
+    expect(again).not.toBeNull();
+    await drain(again!);
+  });
+
+  it("Fix A: falls back to the raw-frame regex when the error has no structured type/code field", async () => {
+    // No `error.type`/`error.code` at all -- isNonTransportUpstreamRefusal has nothing structured
+    // to read, so it must fall through to matching the raw frame text instead of disabling.
+    script = (_s, reply) =>
+      reply({ type: "error", message: "usage_limit_reached: try again later", status_code: 429 });
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    expect(turn).toBeNull();
+    expect(codexWsStatus().enabled).toBe(true);
   });
 
   it("returns null when the runtime has no WebSocket global", async () => {
@@ -459,5 +775,107 @@ describe("a turn that ends in response.incomplete", () => {
     const t2 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi again")], headers: {} });
     await drain(t2!);
     expect(socketsOpened).toBe(1);
+  });
+});
+
+// ── Regression: the reason-upgrade must never turn a completed turn into a failure ────────────
+//
+// closeSession lets a later, more informative close reason (typically onclose's `closed
+// code=...`, arriving a moment after onerror's generic "websocket error") reach a turn that is
+// still waiting on `failure`. Adversarial review found the first version of that upgrade wrote
+// into `failure` unconditionally, so a turn that had ALREADY reached `response.completed` --
+// `finished=true`, `failure` left null -- got its `failure` set retroactively by a stray
+// onerror+onclose pair the socket fired on its way down anyway. That turned a delivered success
+// into a thrown "codex websocket: closed code=..." abort, which downstream (codex-oauth.ts)
+// reports as a mid-stream abort and appends a `[codex proxy error:CCX_STREAM_ABORTED]` block to
+// an otherwise-complete response. Fixed by making the hook an upgrade of an EXISTING failure,
+// never a creation: it only overwrites `failure` when something has already set it.
+
+describe("reason upgrade", () => {
+  it("does not fail a turn that already reached response.completed before the socket errors and closes", async () => {
+    script = (_s, reply) => {
+      reply({ type: "response.created", response: { id: "resp-1" } });
+      reply({ type: "response.completed", response: { id: "resp-1", usage: {} } });
+      // The socket dying on its way down, moments after the turn already finished cleanly.
+      // onerror fires first (as it does on a real reset) and finds the turn already `finished`,
+      // so it is a no-op; onclose then finds the session already torn down and offers its
+      // (unused, here) upgrade. Neither may set `failure` from null.
+      lastSocket!.onerror?.({ message: "websocket error" });
+      lastSocket!.onclose?.({ code: 1006, reason: "" });
+    };
+    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    expect(t1).not.toBeNull();
+
+    // The direct, externally-visible half of the bug: draining must resolve, not reject. A
+    // reject here is exactly what would have reached codex-oauth.ts as a corrupting mid-stream
+    // abort on a turn whose content had already been delivered.
+    const events = await drain(t1!);
+    expect(events.some((ev) => ev.type === "response.completed")).toBe(true);
+  });
+
+  it("surfaces the upgraded closed-code reason for a turn that is genuinely still in flight", async () => {
+    script = (_s, reply) => {
+      reply({ type: "response.created", response: { id: "resp-1" } });
+      // No response.completed -- this turn never finishes on its own. onerror sets the generic
+      // failure; onclose, arriving in the same synchronous pass, upgrades it before anything has
+      // read `failure`.
+      lastSocket!.onerror?.({ message: "websocket error" });
+      lastSocket!.onclose?.({ code: 1006, reason: "" });
+    };
+    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    expect(t1).not.toBeNull();
+    await expect(drain(t1!)).rejects.toThrow(/closed code=1006/);
+  });
+});
+
+// ── describeSocketError, exercised through the connect-failure reporting path ─────────────────
+//
+// The module does not export describeSocketError, in keeping with this file's convention of
+// driving behaviour through the real entry point (see the note at the top). The connect-failure
+// path is where its return value becomes directly observable: `disableTransport` stores exactly
+// what describeSocketError produced, and `codexWsStatus().disabled` reports it back.
+
+describe("describeSocketError, via connect failure reporting", () => {
+  it("falls back to the plain message for a bare error with nothing describeSocketError can add", async () => {
+    connectBehaviour = "fail";
+    // What Node v24's built-in undici actually hands onerror for both a refused connect and a
+    // mid-connection RST, per the reviewer's measurement: an empty `.message` and a `.error`
+    // that is a bare TypeError with no code/errno/syscall and an empty message of its own.
+    failEvent = { message: "", error: new TypeError("") };
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    expect(turn).toBeNull();
+    // Not "TypeError" -- that would be strictly less informative than the old literal and would
+    // break existing log greps for it.
+    expect(codexWsStatus().disabled).toBe("websocket error");
+  });
+
+  it("mines code/errno/syscall off .error when present", async () => {
+    connectBehaviour = "fail";
+    const rich = Object.assign(new Error("connect ECONNREFUSED"), {
+      code: "ECONNREFUSED",
+      errno: -4078,
+      syscall: "connect",
+    });
+    failEvent = { message: "websocket error", error: rich };
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    expect(turn).toBeNull();
+    const disabled = codexWsStatus().disabled;
+    expect(disabled).toMatch(/ECONNREFUSED/);
+    expect(disabled).toMatch(/syscall=connect/);
+  });
+
+  it("walks one level into .error.cause when .error itself is a bare wrapper", async () => {
+    connectBehaviour = "fail";
+    const cause = Object.assign(new Error("read ECONNRESET"), {
+      code: "ECONNRESET",
+      errno: -4077,
+      syscall: "read",
+    });
+    const wrapper = new TypeError("");
+    (wrapper as unknown as { cause?: unknown }).cause = cause;
+    failEvent = { message: "", error: wrapper };
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    expect(turn).toBeNull();
+    expect(codexWsStatus().disabled).toMatch(/ECONNRESET/);
   });
 });

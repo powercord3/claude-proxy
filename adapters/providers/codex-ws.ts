@@ -62,7 +62,7 @@ interface CodexSocket {
   close(code?: number, reason?: string): void;
   onopen: (() => void) | null;
   onmessage: ((ev: WsEvent) => void) | null;
-  onerror: ((ev: { message?: string }) => void) | null;
+  onerror: ((ev: { message?: string; error?: unknown }) => void) | null;
   onclose: ((ev: WsCloseEvent) => void) | null;
 }
 type SocketCtor = new (
@@ -132,26 +132,71 @@ function canon(item: unknown): string {
 }
 
 /**
- * The form the client will echo a server output item back to us in, or null when the item is
- * one the client never replays (reasoning) or one we cannot model.
- *
- * A `null` from an item we cannot model is not the same as one we skip: the caller invalidates
- * the whole baseline on an unmodelled item, because guessing wrong here would splice a delta
- * onto a context that does not match and produce a subtly wrong conversation. Skipping costs
- * one full resend; guessing costs correctness.
+ * Fix C (part 2): `arguments` is a JSON string, and the server's spacing is not guaranteed to
+ * match what Claude Code re-emits when it round-trips a tool call through a parsed object and
+ * back (`JSON.stringify(block.input)` in toResponsesInput). One byte of whitespace must not
+ * refuse a whole delta, so both sides of the comparison are canonicalized through parse+
+ * stringify before being compared. A string that fails to parse is left unchanged rather than
+ * dropped -- an item we cannot canonicalize should still compare literally, not disappear.
  */
-function echoFormOf(item: Record<string, unknown>): { canon: string | null; modelled: boolean } {
+function canonicalizeArguments(raw: unknown): unknown {
+  if (typeof raw !== "string") return raw;
+  try {
+    return JSON.stringify(JSON.parse(raw));
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * Canonicalize one item for baseline comparison, applying the `arguments` normalization above to
+ * `function_call` items. Key order matters (`canon` is a plain JSON.stringify), so this keeps
+ * the existing `type, call_id, name, arguments` order by overriding a key already present in the
+ * spread rather than reconstructing the object.
+ */
+function canonItem(item: Record<string, unknown>): string {
+  if (item.type === "function_call") {
+    return canon({ ...item, arguments: canonicalizeArguments(item.arguments) });
+  }
+  return canon(item);
+}
+
+type OutputClassification =
+  | { kind: "skip" }
+  | { kind: "message"; text: string }
+  | { kind: "function_call"; call: Record<string, unknown> }
+  | { kind: "unmodelled" };
+
+/**
+ * How a server output item relates to what the client will echo back next turn.
+ *
+ * `reasoning` and `web_search_call` are "skip": the client never replays either one (reasoning
+ * is dropped by toResponsesInput; a web_search_call is never surfaced to Claude Code as a
+ * replayable block), so both are simply absent from the baseline rather than invalidating it --
+ * the server's own connection-local state still carries them via previous_response_id. `message`
+ * and `function_call` are "modelled": the caller groups every item in a turn into the shape the
+ * client actually rebuilds an assistant turn as (ALL text joined into ONE `message` item,
+ * followed by ALL `function_call` items in order -- see toResponsesInput), which is why this
+ * returns raw text/call fragments rather than a finished canon per item.
+ *
+ * "unmodelled" is not the same as "skip": the caller invalidates the whole baseline on an
+ * unmodelled item, because guessing wrong here would splice a delta onto a context that does not
+ * match and produce a subtly wrong conversation. Skipping costs one full resend; guessing costs
+ * correctness. Keep genuinely unknown future item types unmodelled -- only reasoning and
+ * web_search_call are known to be never echoed.
+ */
+function classifyOutputItem(item: Record<string, unknown>): OutputClassification {
   const type = item.type as string | undefined;
-  if (type === "reasoning") return { canon: null, modelled: true };
+  if (type === "reasoning" || type === "web_search_call") return { kind: "skip" };
   if (type === "function_call") {
     return {
-      canon: canon({
+      kind: "function_call",
+      call: {
         type: "function_call",
         call_id: item.call_id,
         name: item.name,
         arguments: item.arguments,
-      }),
-      modelled: true,
+      },
     };
   }
   if (type === "message") {
@@ -160,13 +205,9 @@ function echoFormOf(item: Record<string, unknown>): { canon: string | null; mode
       .filter((p) => p.type === "output_text" || p.type === "text")
       .map((p) => p.text ?? "")
       .join("");
-    return {
-      canon: canon({ type: "message", role: "assistant", content: [{ type: "output_text", text }] }),
-      modelled: true,
-    };
+    return { kind: "message", text };
   }
-  // web_search_call and anything else the backend grows later.
-  return { canon: null, modelled: false };
+  return { kind: "unmodelled" };
 }
 
 // ── Session pool ─────────────────────────────────────────────────────────────
@@ -191,6 +232,14 @@ type Session = {
   // the next turn as if it belonged to it.
   onFrame: ((raw: string) => void) | null;
   onDrop: ((reason: string) => void) | null;
+  // `onerror` fires before `onclose` on a socket reset, so the turn is already told about the
+  // drop (via onDrop, above) using onerror's reason before onclose's -- usually more informative
+  // -- reason is even known. This lets a turn still waiting on that reason accept a better one
+  // that arrives moments later, without re-running teardown or invoking onDrop a second time.
+  // Deliberately NOT cleared by closeSession itself (unlike onFrame/onDrop): it must stay live
+  // across the teardown that onDrop's first call triggers, and is cleared by the turn once the
+  // reason has actually been consumed.
+  onReasonUpgrade: ((reason: string) => void) | null;
 };
 
 const sessions: Session[] = [];
@@ -202,7 +251,16 @@ let transportDisabled = false;
 let disabledReason = "";
 
 function closeSession(s: Session, reason: string) {
-  if (s.closed) return;
+  if (s.closed) {
+    // Teardown already ran -- most commonly onerror firing a moment before onclose, whose
+    // `closed code=... reason=...` names the actual failure where onerror's was a generic
+    // fallback literal. Do not repeat any teardown side effect (the socket is already closed,
+    // already spliced out of `sessions`, and onDrop must not fire twice); just let a turn that
+    // has not yet consumed the first reason see this better one instead.
+    const upgrade = s.onReasonUpgrade;
+    if (upgrade) upgrade(reason);
+    return;
+  }
   s.closed = true;
   const onDrop = s.onDrop;
   s.onDrop = null;
@@ -231,6 +289,35 @@ function reapSessions() {
     if (now - s.openedAt > MAX_SESSION_MS) closeSession(s, "session age limit");
     else if (now - s.lastUsedAt > MAX_IDLE_MS) closeSession(s, "idle");
   }
+}
+
+// Fix A: an `error` frame naming one of these is an ordinary upstream refusal (plan quota,
+// replica overload), not a transport fault. It must fail this turn over to HTTPS exactly like
+// an expired `previous_response_id` already does, without disabling the socket for the rest of
+// the process -- disabling it here is what turned one quota hit into 1,993/2,043 turns
+// re-uploading the full transcript in production. Genuine transport faults (connect failure,
+// socket close, protocol error) are not in this set and keep disabling as before.
+const NON_TRANSPORT_UPSTREAM_ERROR_TYPES = new Set([
+  "usage_limit_reached",
+  "server_is_overloaded",
+  "service_unavailable_error",
+]);
+
+/**
+ * Prefers the parsed error frame's `type`/`code` field over a substring match: a structured
+ * field that does not name one of these is trusted over falling through to the regex, since
+ * the regex is a fallback for a frame that has no structured field to read at all.
+ */
+function isNonTransportUpstreamRefusal(errType: unknown, errCode: unknown, raw: string): boolean {
+  const type = typeof errType === "string" ? errType : undefined;
+  const code = typeof errCode === "string" ? errCode : undefined;
+  if (type !== undefined || code !== undefined) {
+    return (
+      (type !== undefined && NON_TRANSPORT_UPSTREAM_ERROR_TYPES.has(type)) ||
+      (code !== undefined && NON_TRANSPORT_UPSTREAM_ERROR_TYPES.has(code))
+    );
+  }
+  return /usage_limit_reached|server_is_overloaded|service_unavailable_error/i.test(raw);
 }
 
 /** Disable the transport for the life of the process after a failure. */
@@ -266,6 +353,37 @@ function registerShutdownHandlers() {
   process.on("beforeExit", closeAll);
 }
 
+// The undici `ErrorEvent` handed to `onerror` carries `.message` (a generic library string, e.g.
+// "websocket error") and, separately, `.error` -- sometimes the actual exception, with
+// `code`/`errno`/`syscall` (ECONNRESET, ETIMEDOUT, UND_ERR_SOCKET, ...). It is not reliably that,
+// though: measured on this host's Node v24 built-in undici, both a refused connect and an abrupt
+// mid-connection RST hand `.error` a bare `TypeError` with an empty `.message` and none of those
+// fields -- mining it blindly would print the unhelpful "TypeError" in place of the old, already
+// -unhelpful-but-at-least-consistent "websocket error" literal. So this only prefers `.error` (or
+// one level into `.error.cause`, where undici sometimes nests the real errno'd cause) over the
+// `.message` fallback when it actually carries something the fallback lacks: a `code`/`errno`
+// /`syscall`, or a non-empty `.message` of its own.
+function describeSocketError(ev: { message?: string; error?: unknown } | null | undefined): string {
+  const fallback = ev?.message ? String(ev.message) : "websocket error";
+  const candidates = [ev?.error, (ev?.error as { cause?: unknown } | undefined)?.cause];
+  for (const err of candidates) {
+    if (!err || typeof err !== "object") continue;
+    const e = err as { name?: unknown; message?: unknown; code?: unknown; errno?: unknown; syscall?: unknown };
+    const detail: string[] = [];
+    if (typeof e.code === "string" || typeof e.code === "number") detail.push(`code=${e.code}`);
+    if (typeof e.errno === "string" || typeof e.errno === "number") detail.push(`errno=${e.errno}`);
+    if (typeof e.syscall === "string" && e.syscall) detail.push(`syscall=${e.syscall}`);
+    const hasMessage = typeof e.message === "string" && e.message.length > 0;
+    if (!detail.length && !hasMessage) continue; // a bare constructor name is not an improvement
+    const head: string[] = [];
+    if (typeof e.name === "string" && e.name) head.push(e.name);
+    if (hasMessage) head.push(e.message as string);
+    if (detail.length) head.push(`(${detail.join(" ")})`);
+    return head.join(": ");
+  }
+  return fallback;
+}
+
 function connect(headers: Record<string, string>): Promise<Session> {
   registerShutdownHandlers();
   return new Promise((resolve, reject) => {
@@ -299,6 +417,7 @@ function connect(headers: Record<string, string>): Promise<Session> {
       closed: false,
       onFrame: null,
       onDrop: null,
+      onReasonUpgrade: null,
     };
 
     socket.onopen = () => {
@@ -308,7 +427,7 @@ function connect(headers: Record<string, string>): Promise<Session> {
       resolve(session);
     };
     socket.onerror = (ev) => {
-      const message = ev?.message ? String(ev.message) : "websocket error";
+      const message = describeSocketError(ev);
       if (!settled) {
         settled = true;
         clearTimeout(timer);
@@ -393,6 +512,62 @@ function takeFreeSession(): Session | null {
   return null;
 }
 
+// Fix E: findResumable returning null used to mean the caller only ever logged "ws turn full",
+// with no way to tell which of the four independent causes (see the file header) was at fault
+// this time. Off by default -- CCX_CODEX_WS_DIAG=1 to enable, no code edit needed -- because it
+// walks and truncated-stringifies every pooled baseline, which is wasted work on the hot path
+// once the cause is already known.
+function isWsResumeDiagEnabled(): boolean {
+  const raw = process.env.CCX_CODEX_WS_DIAG;
+  if (!raw) return false;
+  const v = raw.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "on";
+}
+
+/** The pooled session sharing the longest common item prefix with this request, if any. */
+function bestCandidateSession(itemCanons: string[]): Session | null {
+  let best: Session | null = null;
+  let bestScore = -1;
+  for (const s of sessions) {
+    if (!s.baseline) continue;
+    const base = s.baseline.items;
+    let common = 0;
+    const max = Math.min(base.length, itemCanons.length);
+    while (common < max && base[common] === itemCanons[common]) common += 1;
+    if (common > bestScore) {
+      bestScore = common;
+      best = s;
+    }
+  }
+  return best;
+}
+
+/** Names why the best candidate session was not resumable: shell match, lengths, first
+ * divergent index, and a truncated canon of both sides at that index. */
+function logResumeDiagnostic(itemCanons: string[], shell: string) {
+  if (!isWsResumeDiagEnabled()) return;
+  const candidate = bestCandidateSession(itemCanons);
+  if (!candidate || !candidate.baseline) {
+    console.log(`[codex] ws resume-diag: no pooled session has a baseline (pool size ${sessions.length})`);
+    return;
+  }
+  const base = candidate.baseline;
+  const shellMatch = base.shell === shell;
+  const max = Math.min(base.items.length, itemCanons.length);
+  let divergeAt = -1;
+  for (let i = 0; i < max; i++) {
+    if (base.items[i] !== itemCanons[i]) {
+      divergeAt = i;
+      break;
+    }
+  }
+  if (divergeAt === -1 && base.items.length !== itemCanons.length) divergeAt = max;
+  const trunc = (s: string | undefined) => (s === undefined ? "<end>" : s.slice(0, 200));
+  console.log(
+    `[codex] ws resume-diag: shellMatch=${shellMatch} baselineLen=${base.items.length} requestLen=${itemCanons.length} divergeAt=${divergeAt} baseline@div=${trunc(base.items[divergeAt])} request@div=${trunc(itemCanons[divergeAt])}`,
+  );
+}
+
 /**
  * Attempt this turn over the WebSocket transport.
  *
@@ -405,7 +580,7 @@ export async function runCodexWsTurn(params: CodexWsParams): Promise<CodexWsTurn
   reapSessions();
 
   const shell = shellHashOf(params.shellBody);
-  const itemCanons = params.input.map(canon);
+  const itemCanons = params.input.map((item) => canonItem(item as unknown as Record<string, unknown>));
 
   let session = findResumable(itemCanons, shell);
   let incremental = false;
@@ -425,6 +600,8 @@ export async function runCodexWsTurn(params: CodexWsParams): Promise<CodexWsTurn
       session = null;
     }
   }
+
+  if (!incremental) logResumeDiagnostic(itemCanons, shell);
 
   if (!session) {
     session = takeFreeSession();
@@ -469,9 +646,16 @@ export async function runCodexWsTurn(params: CodexWsParams): Promise<CodexWsTurn
   let waiter: (() => void) | null = null;
   let finished = false;
   let failure: string | null = null;
-  // Rebuilt as the response streams; committed to the session only at response.completed.
-  const serverEcho: string[] = [];
+  // Rebuilt as the response streams; committed to the session only at response.completed. Held
+  // as text/function_call buffers rather than a flat item list -- see classifyOutputItem's doc
+  // comment for why they are grouped this way before being canonicalized (Fix C).
+  let echoHasMessage = false;
+  const echoTexts: string[] = [];
+  const echoCalls: Record<string, unknown>[] = [];
   let baselineUsable = true;
+  // Set when an `error` frame names an ordinary upstream refusal rather than a transport fault
+  // (Fix A) -- read after the first-frame wait below to decide whether to disable the transport.
+  let nonTransportReason = false;
   let responseId = "";
 
   const wake = () => {
@@ -485,6 +669,17 @@ export async function runCodexWsTurn(params: CodexWsParams): Promise<CodexWsTurn
     failure = reason;
     finished = true;
     wake();
+  };
+  // Lets closeSession hand this turn a better reason after onDrop already fired with a worse
+  // one (see the doc comment on Session.onReasonUpgrade). Deliberately an UPGRADE, never a
+  // creation: it only overwrites an already-set `failure`, never sets one from null. A turn can
+  // also reach `finished` via `response.completed` (below) with `failure` left null -- onDrop's
+  // own `if (finished) return` guard keeps that turn's failure null even if the socket then
+  // errors or closes on the way down, and this hook must preserve that: writing into `failure`
+  // unconditionally here would turn a turn that already completed successfully into a thrown
+  // abort merely because the socket's teardown produced two events instead of one.
+  active.onReasonUpgrade = (reason) => {
+    if (failure !== null) failure = reason;
   };
   active.onFrame = (raw) => {
     if (finished) return;
@@ -501,6 +696,8 @@ export async function runCodexWsTurn(params: CodexWsParams): Promise<CodexWsTurn
     // which is recoverable: the caller resends in full over HTTPS and the next turn opens a
     // fresh chain.
     if (type === "error") {
+      const errObj = ev.error as Record<string, unknown> | undefined;
+      nonTransportReason = isNonTransportUpstreamRefusal(errObj?.type, errObj?.code, raw);
       failure = `error frame: ${raw.slice(0, 400)}`;
       finished = true;
       wake();
@@ -521,9 +718,17 @@ export async function runCodexWsTurn(params: CodexWsParams): Promise<CodexWsTurn
     if (type === "response.output_item.done") {
       const item = ev.item as Record<string, unknown> | undefined;
       if (item) {
-        const { canon: c, modelled } = echoFormOf(item);
-        if (!modelled) baselineUsable = false;
-        else if (c) serverEcho.push(c);
+        const cls = classifyOutputItem(item);
+        if (cls.kind === "unmodelled") baselineUsable = false;
+        else if (cls.kind === "message") {
+          echoHasMessage = true;
+          echoTexts.push(cls.text);
+        } else if (cls.kind === "function_call") {
+          echoCalls.push(cls.call);
+        }
+        // cls.kind === "skip" (reasoning, web_search_call): never echoed back by the client,
+        // absent from the baseline, chain preserved -- the server's own connection-local state
+        // still carries it via previous_response_id.
       }
     }
     if (type === "response.completed") {
@@ -542,6 +747,7 @@ export async function runCodexWsTurn(params: CodexWsParams): Promise<CodexWsTurn
     active.socket.send(text);
   } catch (err) {
     active.busy = false;
+    active.onReasonUpgrade = null;
     closeSession(active, `send failed: ${String(err)}`);
     disableTransport(err instanceof Error ? err.message : String(err));
     return null;
@@ -570,12 +776,22 @@ export async function runCodexWsTurn(params: CodexWsParams): Promise<CodexWsTurn
     active.busy = false;
     active.onFrame = null;
     active.onDrop = null;
+    active.onReasonUpgrade = null;
     const reason = failure ?? "no first frame";
     closeSession(active, reason);
-    // An expired chain is a normal consequence of the server's connection-local cache and must
-    // not disable the transport; a dead socket should.
-    if (!/previous_response_id/i.test(reason)) disableTransport(reason);
-    else console.log(`[codex] ws chain expired (${reason.slice(0, 120)}) - resending in full over HTTPS`);
+    // An expired chain (server dropped its connection-local cache) or an ordinary upstream
+    // refusal (Fix A: quota, overload) is a normal consequence of talking to a shared backend
+    // and must not disable the transport; a genuine transport fault -- connect failure, socket
+    // close, protocol error -- should.
+    if (/previous_response_id/i.test(reason)) {
+      console.log(`[codex] ws chain expired (${reason.slice(0, 120)}) - resending in full over HTTPS`);
+    } else if (nonTransportReason) {
+      console.log(
+        `[codex] ws turn refused by upstream (${reason.slice(0, 120)}) - resending in full over HTTPS, transport stays enabled`,
+      );
+    } else {
+      disableTransport(reason);
+    }
     return null;
   }
 
@@ -611,6 +827,16 @@ export async function runCodexWsTurn(params: CodexWsParams): Promise<CodexWsTurn
       // session's chain untouched and unusable, which is what we want: the next turn will not
       // match it and will resend in full.
       if (responseId && baselineUsable) {
+        // Fix C: group into the shape the client will actually rebuild -- ALL text from this
+        // turn joined into ONE `message` item, then the `function_call` items in order -- rather
+        // than one echo entry per server output item. See classifyOutputItem's doc comment.
+        const serverEcho: string[] = [];
+        if (echoHasMessage) {
+          serverEcho.push(
+            canon({ type: "message", role: "assistant", content: [{ type: "output_text", text: echoTexts.join("") }] }),
+          );
+        }
+        for (const call of echoCalls) serverEcho.push(canonItem(call));
         active.baseline = {
           items: [...itemCanons, ...serverEcho],
           previousResponseId: responseId,
@@ -623,6 +849,7 @@ export async function runCodexWsTurn(params: CodexWsParams): Promise<CodexWsTurn
       active.busy = false;
       active.onFrame = null;
       active.onDrop = null;
+      active.onReasonUpgrade = null;
       active.lastUsedAt = Date.now();
       if (failure) closeSession(active, failure);
     }
