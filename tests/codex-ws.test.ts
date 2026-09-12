@@ -396,6 +396,45 @@ describe("Fix B: trailing developer messages must not need history to reorder fo
 // call site now imports and uses for BOTH `httpInput` and `wsInput`, so this drives production
 // code directly rather than a copy of its formula.
 
+describe("Fix B escape hatch: CCX_CODEX_WS_RAW_ORDER=0 restores the reorder on the WS path", () => {
+  // Fix B drops the trailing-developer reorder on the WS path so the item list is append-only.
+  // The reorder was not incidental -- it exists so the model's last-read item is the user's
+  // actionable task rather than an ambient system-reminder -- and its loss would degrade
+  // instruction-following SILENTLY rather than raising anything. This flag is the documented way
+  // back without a code edit, so it is tested rather than assumed to work.
+  const messages: AnthropicMessage[] = [
+    { role: "user", content: "u1" },
+    { role: "assistant", content: [{ type: "tool_use", id: "call-1", name: "read_file", input: {} }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "call-1", content: "out1" }] },
+    { role: "developer", content: "reminder" },
+  ];
+
+  afterEach(() => {
+    delete process.env.CCX_CODEX_WS_RAW_ORDER;
+  });
+
+  it("defaults to raw order, so wsInput differs from httpInput", () => {
+    delete process.env.CCX_CODEX_WS_RAW_ORDER;
+    const { httpInput, wsInput } = buildResponsesInputs(messages, []);
+    expect(wsInput).toEqual(toResponsesInput(messages, []));
+    expect(wsInput).not.toEqual(httpInput);
+  });
+
+  it("with the flag set to 0, wsInput takes the reordered list exactly like httpInput", () => {
+    process.env.CCX_CODEX_WS_RAW_ORDER = "0";
+    const { httpInput, wsInput } = buildResponsesInputs(messages, []);
+    expect(wsInput).toEqual(toResponsesInput(normalizeMessagesForResponses(messages), []));
+    expect(wsInput).toEqual(httpInput);
+    // And the actionable item is last again -- the property the reorder exists to provide.
+    expect(wsInput.at(-1)).toEqual({ type: "function_call_output", call_id: "call-1", output: "out1" });
+  });
+
+  it("only 0 disables it; any other value keeps raw order", () => {
+    process.env.CCX_CODEX_WS_RAW_ORDER = "1";
+    expect(buildResponsesInputs(messages, []).wsInput).toEqual(toResponsesInput(messages, []));
+  });
+});
+
 describe("Fix B regression: buildResponsesInputs is the one place httpInput/wsInput are chosen", () => {
   it("reorders httpInput but leaves wsInput in raw order for a body ending in a trailing developer message", () => {
     const messages: AnthropicMessage[] = [

@@ -464,7 +464,26 @@ export type ResponsesInputs = {
  *
  * Both fields are consumed at the one call site in chatCodexOAuthInner, so reverting this choice
  * means changing this function rather than an inline expression a future edit can silently drop.
+ *
+ * KNOWN TRADE-OFF, and the reason for the escape hatch below. The reorder is not incidental: its
+ * own test is named "moves trailing developer context before the final user prompt", i.e. it
+ * exists so the model's LAST-read item is the user's actionable task rather than ambient MCP
+ * status or a skill listing. Dropping it on the WS path means gpt-5.6 reads the system-reminders
+ * last. That is what Claude Code natively sends to Anthropic, so it is not novel, but its effect
+ * on instruction-following here is UNMEASURED -- and it would degrade silently, as a slightly
+ * worse agent rather than an error. Keeping both properties is not possible: reordering only
+ * within the delta puts the permuted tail into history on the following turn, which breaks the
+ * strict prefix again, which is the whole bug.
+ *
+ * So the choice is reversible without a code edit. CCX_CODEX_WS_RAW_ORDER=0 restores the reorder
+ * on the WS path, accepting full resends (the pre-fix behaviour) in exchange for actionable-last.
+ * Default is raw order, because the cost of the reorder here is measured at 1,993/2,043 turns
+ * re-uploading the full transcript and the benefit is not.
  */
+export function isWsRawOrderEnabled(): boolean {
+  return process.env.CCX_CODEX_WS_RAW_ORDER !== "0";
+}
+
 export function buildResponsesInputs(
   messages: AnthropicMessage[],
   cachedReasoning: ResponseItem[],
@@ -472,7 +491,7 @@ export function buildResponsesInputs(
   const reordered = normalizeMessagesForResponses(messages);
   return {
     httpInput: toResponsesInput(reordered, cachedReasoning),
-    wsInput: toResponsesInput(messages, []),
+    wsInput: toResponsesInput(isWsRawOrderEnabled() ? messages : reordered, []),
   };
 }
 
