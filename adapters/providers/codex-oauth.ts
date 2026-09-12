@@ -1305,6 +1305,7 @@ async function chatCodexOAuthInner(
       shellBody,
       input: inputForWs,
       headers,
+      conversationKey: convoKey,
     });
     if (wsTurn) {
       markLaneOk(lane);

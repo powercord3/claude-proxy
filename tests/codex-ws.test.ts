@@ -89,6 +89,10 @@ const fnOut = (callId: string, output: string): ResponseItem =>
   ({ type: "function_call_output", call_id: callId, output }) as unknown as ResponseItem;
 
 const SHELL = { model: "gpt-5.6-luna", instructions: "be terse", store: false, stream: true };
+// One arbitrary conversation identity shared by every test below that is not specifically
+// exercising Finding 3's cross-conversation guard, so requiring conversationKey to match does not
+// change any of their existing behaviour.
+const CONVO = "convo-default";
 
 /** A server turn that thinks, calls a tool, and completes. */
 function toolCallScript(responseId: string, callId: string): Script {
@@ -133,7 +137,7 @@ describe("isCodexWsEnabled", () => {
 
   it("returns null from runCodexWsTurn when opted out, without opening a socket", async () => {
     process.env.CCX_CODEX_WS = "0";
-    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     expect(turn).toBeNull();
     expect(socketsOpened).toBe(0);
   });
@@ -144,7 +148,7 @@ describe("isCodexWsEnabled", () => {
 describe("incremental continuation", () => {
   it("sends the full input on the first turn and no previous_response_id", async () => {
     script = toolCallScript("resp-1", "call-1");
-    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {} });
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {}, conversationKey: CONVO });
     expect(turn).not.toBeNull();
     await drain(turn!);
 
@@ -157,7 +161,7 @@ describe("incremental continuation", () => {
 
   it("sends only the new items on the second turn, chained to the first response id", async () => {
     script = toolCallScript("resp-1", "call-1");
-    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {} });
+    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {}, conversationKey: CONVO });
     await drain(t1!);
 
     // What Claude Code replays next turn: the original user message, the assistant's tool call
@@ -174,6 +178,7 @@ describe("incremental continuation", () => {
       shellBody: SHELL,
       input: [userMsg("read a.txt"), fnCall("call-1"), fnOut("call-1", "a\nb\nc")],
       headers: {},
+      conversationKey: CONVO,
     });
     await drain(t2!);
 
@@ -189,7 +194,7 @@ describe("incremental continuation", () => {
 
   it("chains a third turn onto the second, absorbing the assistant message the server produced", async () => {
     script = toolCallScript("resp-1", "call-1");
-    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {} }))!);
+    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {}, conversationKey: CONVO }))!);
 
     script = (_s, reply) => {
       reply({ type: "response.created", response: { id: "resp-2" } });
@@ -204,6 +209,7 @@ describe("incremental continuation", () => {
         shellBody: SHELL,
         input: [userMsg("read a.txt"), fnCall("call-1"), fnOut("call-1", "a\nb\nc")],
         headers: {},
+        conversationKey: CONVO,
       }))!,
     );
 
@@ -221,6 +227,7 @@ describe("incremental continuation", () => {
         userMsg("thanks"),
       ],
       headers: {},
+      conversationKey: CONVO,
     });
     await drain(t3!);
 
@@ -256,7 +263,7 @@ describe("Fix C: server echo canonicalization", () => {
       });
       reply({ type: "response.completed", response: { id: "resp-1", usage: {} } });
     };
-    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("go")], headers: {} }))!);
+    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("go")], headers: {}, conversationKey: CONVO }))!);
 
     // What Claude Code actually replays next turn: ALL text from the turn joined into ONE
     // message, THEN both tool calls -- never the interleaved shape the server streamed it in.
@@ -273,6 +280,7 @@ describe("Fix C: server echo canonicalization", () => {
       shellBody: SHELL,
       input: [userMsg("go"), assistantTurn, fnCall("call-1"), fnCall("call-2"), userMsg("thanks")],
       headers: {},
+      conversationKey: CONVO,
     });
     await drain(t2!);
 
@@ -292,7 +300,7 @@ describe("Fix C: server echo canonicalization", () => {
       });
       reply({ type: "response.completed", response: { id: "resp-1", usage: {} } });
     };
-    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("go")], headers: {} }))!);
+    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("go")], headers: {}, conversationKey: CONVO }))!);
 
     script = toolCallScript("resp-2", "call-2");
     const t2 = await runCodexWsTurn({
@@ -301,6 +309,7 @@ describe("Fix C: server echo canonicalization", () => {
       // out compactly -- no space after the colon -- even though the server sent one.
       input: [userMsg("go"), fnCall("call-1", '{"path":"/a"}'), fnOut("call-1", "contents")],
       headers: {},
+      conversationKey: CONVO,
     });
     await drain(t2!);
 
@@ -345,11 +354,11 @@ describe("Fix B: trailing developer messages must not need history to reorder fo
       });
       reply({ type: "response.completed", response: { id: "resp-1", usage: {} } });
     };
-    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: toResponsesInput(msgs1, []), headers: {} });
+    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: toResponsesInput(msgs1, []), headers: {}, conversationKey: CONVO });
     await drain(t1!);
 
     script = toolCallScript("resp-2", "call-2");
-    const t2 = await runCodexWsTurn({ shellBody: SHELL, input: toResponsesInput(msgs2, []), headers: {} });
+    const t2 = await runCodexWsTurn({ shellBody: SHELL, input: toResponsesInput(msgs2, []), headers: {}, conversationKey: CONVO });
     await drain(t2!);
 
     expect(t2!.incremental).toBe(true);
@@ -370,6 +379,7 @@ describe("Fix B: trailing developer messages must not need history to reorder fo
       shellBody: SHELL,
       input: toResponsesInput(normalizeMessagesForResponses(msgs1), []),
       headers: {},
+      conversationKey: CONVO,
     });
     await drain(t1!);
 
@@ -378,6 +388,7 @@ describe("Fix B: trailing developer messages must not need history to reorder fo
       shellBody: SHELL,
       input: toResponsesInput(normalizeMessagesForResponses(msgs2), []),
       headers: {},
+      conversationKey: CONVO,
     });
     await drain(t2!);
 
@@ -500,7 +511,7 @@ describe("Fix B regression: buildResponsesInputs is the one place httpInput/wsIn
 describe("refuses to continue a chain it cannot prove", () => {
   it("resends in full when an earlier item changed rather than being appended to", async () => {
     script = toolCallScript("resp-1", "call-1");
-    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {} }))!);
+    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {}, conversationKey: CONVO }))!);
 
     script = toolCallScript("resp-2", "call-2");
     const t2 = await runCodexWsTurn({
@@ -509,6 +520,7 @@ describe("refuses to continue a chain it cannot prove", () => {
       // known to apply. Compaction and edited history both land here.
       input: [userMsg("read b.txt"), fnCall("call-1"), fnOut("call-1", "x")],
       headers: {},
+      conversationKey: CONVO,
     });
     await drain(t2!);
 
@@ -519,7 +531,7 @@ describe("refuses to continue a chain it cannot prove", () => {
 
   it("resends in full when the request shell changes", async () => {
     script = toolCallScript("resp-1", "call-1");
-    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {} }))!);
+    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {}, conversationKey: CONVO }))!);
 
     script = toolCallScript("resp-2", "call-2");
     const t2 = await runCodexWsTurn({
@@ -528,6 +540,7 @@ describe("refuses to continue a chain it cannot prove", () => {
       shellBody: { ...SHELL, reasoning: { effort: "high" } },
       input: [userMsg("read a.txt"), fnCall("call-1"), fnOut("call-1", "x")],
       headers: {},
+      conversationKey: CONVO,
     });
     await drain(t2!);
 
@@ -545,13 +558,14 @@ describe("refuses to continue a chain it cannot prove", () => {
       reply({ type: "response.output_item.done", item: { type: "some_future_tool_call", id: "x_1" } });
       reply({ type: "response.completed", response: { id: "resp-1", usage: {} } });
     };
-    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("search")], headers: {} }))!);
+    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("search")], headers: {}, conversationKey: CONVO }))!);
 
     script = toolCallScript("resp-2", "call-2");
     const t2 = await runCodexWsTurn({
       shellBody: SHELL,
       input: [userMsg("search"), userMsg("again")],
       headers: {},
+      conversationKey: CONVO,
     });
     await drain(t2!);
 
@@ -567,13 +581,14 @@ describe("refuses to continue a chain it cannot prove", () => {
       reply({ type: "response.output_item.done", item: { type: "web_search_call", id: "ws_1" } });
       reply({ type: "response.completed", response: { id: "resp-1", usage: {} } });
     };
-    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("search")], headers: {} }))!);
+    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("search")], headers: {}, conversationKey: CONVO }))!);
 
     script = toolCallScript("resp-2", "call-2");
     const t2 = await runCodexWsTurn({
       shellBody: SHELL,
       input: [userMsg("search"), userMsg("again")],
       headers: {},
+      conversationKey: CONVO,
     });
     await drain(t2!);
 
@@ -593,7 +608,7 @@ describe("refuses to continue a chain it cannot prove", () => {
       // no response.completed; the socket dies instead
       reply({ type: "error", status: 500, error: { message: "boom" } });
     };
-    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     // The first frame arrived, so this is a mid-stream abort rather than a fallback.
     expect(t1).not.toBeNull();
     await expect(drain(t1!)).rejects.toThrow(/codex websocket/);
@@ -605,13 +620,13 @@ describe("refuses to continue a chain it cannot prove", () => {
 describe("falls back to HTTPS rather than failing a request", () => {
   it("returns null and disables the transport when the socket will not open", async () => {
     connectBehaviour = "fail";
-    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     expect(turn).toBeNull();
     expect(codexWsStatus().enabled).toBe(false);
 
     // A dead network should be paid for once, not on every subsequent turn.
     connectBehaviour = "open";
-    const again = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const again = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     expect(again).toBeNull();
     expect(socketsOpened).toBe(1);
   });
@@ -621,14 +636,14 @@ describe("falls back to HTTPS rather than failing a request", () => {
     // ordinary upstream refusal -- this must fall through to disabling the transport exactly as
     // before, not just fail this one turn over.
     script = (_s, reply) => reply({ type: "error", status: 500, error: { message: "internal server hiccup" } });
-    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     expect(turn).toBeNull();
     expect(codexWsStatus().enabled).toBe(false);
   });
 
   it("keeps the transport armed when the failure is only an expired chain", async () => {
     script = toolCallScript("resp-1", "call-1");
-    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {} }))!);
+    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {}, conversationKey: CONVO }))!);
 
     // The server's connection-local cache dropped the response id. This is an ordinary,
     // expected outcome and must not cost the process its websocket transport.
@@ -638,12 +653,13 @@ describe("falls back to HTTPS rather than failing a request", () => {
       shellBody: SHELL,
       input: [userMsg("read a.txt"), fnCall("call-1"), fnOut("call-1", "x")],
       headers: {},
+      conversationKey: CONVO,
     });
     expect(t2).toBeNull();
     expect(codexWsStatus().enabled).toBe(true);
 
     script = toolCallScript("resp-9", "call-9");
-    const t3 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("fresh")], headers: {} });
+    const t3 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("fresh")], headers: {}, conversationKey: CONVO });
     expect(t3).not.toBeNull();
     await drain(t3!);
   });
@@ -669,14 +685,14 @@ describe("falls back to HTTPS rather than failing a request", () => {
         status_code: 429,
         headers: {},
       });
-    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     expect(turn).toBeNull();
     // Assert the REASON the turn failed over, not merely that it did: the transport must still
     // be armed for the very next turn.
     expect(codexWsStatus().enabled).toBe(true);
 
     script = toolCallScript("resp-9", "call-9");
-    const again = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("fresh")], headers: {} });
+    const again = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("fresh")], headers: {}, conversationKey: CONVO });
     expect(again).not.toBeNull();
     await drain(again!);
   });
@@ -686,14 +702,14 @@ describe("falls back to HTTPS rather than failing a request", () => {
     // to read, so it must fall through to matching the raw frame text instead of disabling.
     script = (_s, reply) =>
       reply({ type: "error", message: "usage_limit_reached: try again later", status_code: 429 });
-    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     expect(turn).toBeNull();
     expect(codexWsStatus().enabled).toBe(true);
   });
 
   it("returns null when the runtime has no WebSocket global", async () => {
     delete (globalThis as { WebSocket?: unknown }).WebSocket;
-    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     expect(turn).toBeNull();
   });
 });
@@ -712,9 +728,9 @@ describe("concurrent turns", () => {
       else finish();
     };
 
-    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("first")], headers: {} });
+    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("first")], headers: {}, conversationKey: CONVO });
     const drained1 = drain(t1!);
-    const t2 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("second")], headers: {} });
+    const t2 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("second")], headers: {}, conversationKey: CONVO });
     await drain(t2!);
     releaseFirst!();
     await drained1;
@@ -742,7 +758,7 @@ describe("concurrent turns", () => {
 describe("a turn that ends in response.incomplete", () => {
   it("leaves the next turn resuming from the last GOOD response, with a correct delta", async () => {
     script = toolCallScript("resp-1", "call-1");
-    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {} }))!);
+    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("read a.txt")], headers: {}, conversationKey: CONVO }))!);
 
     // Turn 2 streams a real tool call, then truncates. Routine on a high reasoning effort.
     script = (_s, reply) => {
@@ -760,6 +776,7 @@ describe("a turn that ends in response.incomplete", () => {
       shellBody: SHELL,
       input: [userMsg("read a.txt"), fnCall("call-1"), fnOut("call-1", "a\nb")],
       headers: {},
+      conversationKey: CONVO,
     });
     expect(t2).not.toBeNull();
     // The consumer (handleEvent) throws on this event type. Reproduce that exactly: abandon the
@@ -782,6 +799,7 @@ describe("a turn that ends in response.incomplete", () => {
       shellBody: SHELL,
       input: [userMsg("read a.txt"), fnCall("call-1"), fnOut("call-1", "a\nb"), userMsg("try again")],
       headers: {},
+      conversationKey: CONVO,
     });
     await drain(t3!);
 
@@ -802,7 +820,7 @@ describe("a turn that ends in response.incomplete", () => {
       reply({ type: "response.created", response: { id: "resp-1" } });
       reply({ type: "response.failed", response: { id: "resp-1", error: { message: "nope" } } });
     };
-    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     await expect(
       (async () => {
         for await (const ev of t1!.events) if (ev.type === "response.failed") throw new Error("failed");
@@ -811,7 +829,7 @@ describe("a turn that ends in response.incomplete", () => {
 
     // If busy leaked, this would open a second socket instead of reusing the first.
     script = toolCallScript("resp-2", "call-2");
-    const t2 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi again")], headers: {} });
+    const t2 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi again")], headers: {}, conversationKey: CONVO });
     await drain(t2!);
     expect(socketsOpened).toBe(1);
   });
@@ -842,7 +860,7 @@ describe("reason upgrade", () => {
       lastSocket!.onerror?.({ message: "websocket error" });
       lastSocket!.onclose?.({ code: 1006, reason: "" });
     };
-    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     expect(t1).not.toBeNull();
 
     // The direct, externally-visible half of the bug: draining must resolve, not reject. A
@@ -861,7 +879,7 @@ describe("reason upgrade", () => {
       lastSocket!.onerror?.({ message: "websocket error" });
       lastSocket!.onclose?.({ code: 1006, reason: "" });
     };
-    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     expect(t1).not.toBeNull();
     await expect(drain(t1!)).rejects.toThrow(/closed code=1006/);
   });
@@ -881,7 +899,7 @@ describe("describeSocketError, via connect failure reporting", () => {
     // mid-connection RST, per the reviewer's measurement: an empty `.message` and a `.error`
     // that is a bare TypeError with no code/errno/syscall and an empty message of its own.
     failEvent = { message: "", error: new TypeError("") };
-    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     expect(turn).toBeNull();
     // Not "TypeError" -- that would be strictly less informative than the old literal and would
     // break existing log greps for it.
@@ -896,7 +914,7 @@ describe("describeSocketError, via connect failure reporting", () => {
       syscall: "connect",
     });
     failEvent = { message: "websocket error", error: rich };
-    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     expect(turn).toBeNull();
     const disabled = codexWsStatus().disabled;
     expect(disabled).toMatch(/ECONNREFUSED/);
@@ -913,8 +931,252 @@ describe("describeSocketError, via connect failure reporting", () => {
     const wrapper = new TypeError("");
     (wrapper as unknown as { cause?: unknown }).cause = cause;
     failEvent = { message: "", error: wrapper };
-    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {} });
+    const turn = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
     expect(turn).toBeNull();
     expect(codexWsStatus().disabled).toMatch(/ECONNRESET/);
+  });
+});
+
+// ── Review finding 1: an abandoned turn must not release its socket while its response is live ──
+//
+// The bug: the turn generator's `finally` only closed the session when `failure` was set. A
+// consumer that stops iterating (`for await` breaks -- client disconnect, Esc, an abort) BEFORE
+// any terminal frame for this response arrives leaves `failure` null and `finished` false, so the
+// session went straight back into the pool with the upstream response still streaming.
+// `socket.onmessage` dispatches every frame to whatever `onFrame` is currently installed with no
+// response-id check, so the NEXT turn's `onFrame` would then consume the abandoned response's
+// late frames -- including its eventual `response.completed`, silently pairing the new turn's
+// items with the old response's id.
+
+describe("Review finding 1: an abandoned turn must not release its socket while its response is live", () => {
+  it("closes the session when the consumer stops iterating before any terminal frame arrives, instead of returning it to the pool", async () => {
+    script = (_s, reply) => {
+      reply({ type: "response.created", response: { id: "resp-1" } });
+      reply({
+        type: "response.output_item.done",
+        item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "partial" }] },
+      });
+      // Deliberately no response.completed / response.failed / response.incomplete: the upstream
+      // response is still "live" at the moment the consumer below walks away from it.
+    };
+    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
+    expect(t1).not.toBeNull();
+
+    // The consumer disconnects after the first frame, before any terminal event -- calling
+    // `.return()` on the generator, exactly like a client disconnect or an Esc-triggered abort.
+    for await (const _ev of t1!.events) {
+      break;
+    }
+
+    // Assert the REASON the pool is empty, not merely that a later turn happened to behave: the
+    // socket itself must have been closed by the abandonment path.
+    expect(lastSocket!.closed).toBe(true);
+    expect(codexWsStatus().sessions).toBe(0);
+
+    // A subsequent turn must open a brand-new socket. If the abandoned one had been returned to
+    // the pool instead, this turn's `onFrame` could have been installed on it and would then
+    // receive the FIRST turn's still-streaming, unrelated frames.
+    script = toolCallScript("resp-2", "call-2");
+    const t2 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi again")], headers: {}, conversationKey: CONVO });
+    expect(t2).not.toBeNull();
+    await drain(t2!);
+    expect(socketsOpened).toBe(2);
+  });
+
+  it("does NOT force-close a session that reaches response.completed and is then abandoned by the consumer", async () => {
+    // Discriminates the fix from an over-eager version that closes on every `.return()`: by the
+    // time `response.completed` is yielded, `finished` is already true, so a consumer that reads
+    // it and then stops (the ordinary, ubiquitous shape of every other test in this file) must
+    // still return the socket to the pool.
+    script = toolCallScript("resp-1", "call-1");
+    const t1 = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("hi")], headers: {}, conversationKey: CONVO });
+    for await (const ev of t1!.events) {
+      if (ev.type === "response.completed") break;
+    }
+    expect(lastSocket!.closed).toBe(false);
+    expect(codexWsStatus().sessions).toBe(1);
+  });
+});
+
+// ── Review finding 2: canonicalizeArguments must not equate different out-of-range integers ─────
+//
+// JSON.parse -> JSON.stringify is not lossless outside Number.MAX_SAFE_INTEGER: both
+// "9007199254740993" and "9007199254740992" round-trip to the SAME text ("9007199254740992"),
+// verified directly against this host's V8. The old canonicalizeArguments compared canonicalized
+// text, so two DIFFERENT tool-call arguments could compare equal and splice a delta onto a
+// context whose real recorded arguments differed.
+
+describe("Review finding 2: canonicalizeArguments must not equate different out-of-range integers", () => {
+  it("does not treat two different integers above 2^53 as equal -- falls back to a full resend rather than a corrupted delta", async () => {
+    script = (_s, reply) => {
+      reply({ type: "response.created", response: { id: "resp-1" } });
+      reply({
+        type: "response.output_item.done",
+        item: { type: "function_call", call_id: "call-1", name: "read_file", arguments: '{"id":9007199254740993}' },
+      });
+      reply({ type: "response.completed", response: { id: "resp-1", usage: {} } });
+    };
+    await drain((await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("go")], headers: {}, conversationKey: CONVO }))!);
+
+    script = toolCallScript("resp-2", "call-2");
+    const t2 = await runCodexWsTurn({
+      shellBody: SHELL,
+      // A DIFFERENT raw integer that the OLD parse+stringify canonicalization collapses to the
+      // exact same text as the one above (both round to 9007199254740992) -- the precise
+      // collision the finding describes.
+      input: [userMsg("go"), fnCall("call-1", '{"id":9007199254740992}'), fnOut("call-1", "contents")],
+      headers: {},
+      conversationKey: CONVO,
+    });
+    await drain(t2!);
+
+    // A false "equal" here would have sent only the function_call_output as a delta against
+    // resp-1's context, silently pairing it with a call whose recorded arguments differ.
+    expect(t2!.incremental).toBe(false);
+    expect(sentPayloads[1].previous_response_id).toBeUndefined();
+  });
+});
+
+// ── Review finding 3: sessions have no conversation identity, so the wrong chain can be resumed ──
+//
+// `findResumable` used to return the FIRST session in pool order whose baseline was a strict
+// prefix, with no discriminator between conversations. Two sessions can hold content-identical
+// (or nested-prefix) baselines while the server's own hidden state differs, because `reasoning`
+// and `web_search_call` items are deliberately omitted from the baseline -- so a request
+// continuing one conversation could resume a DIFFERENT one that merely looks like a prefix match.
+
+describe("Review finding 3: conversation identity in the session pool", () => {
+  const CONVO_A = "convo-a";
+  const CONVO_B = "convo-b";
+
+  const msgScript = (responseId: string, text: string): Script => (_s, reply) => {
+    reply({ type: "response.created", response: { id: responseId } });
+    reply({
+      type: "response.output_item.done",
+      item: { type: "message", role: "assistant", content: [{ type: "output_text", text }] },
+    });
+    reply({ type: "response.completed", response: { id: responseId, usage: {} } });
+  };
+  const assistantEcho = (text: string): ResponseItem =>
+    ({ type: "message", role: "assistant", content: [{ type: "output_text", text }] }) as unknown as ResponseItem;
+
+  it("does not cross-resume two sessions whose baselines are content-identical prefixes but belong to different conversations", async () => {
+    // Force two independent sockets rather than one shared, reused connection: with only one
+    // free session in the pool, a mismatched request would normally just reuse (and wipe) it, so
+    // session A's first turn is held open (not yet completed) while session B's turn runs to
+    // completion on its own, separate socket.
+    let releaseA: (() => void) | null = null;
+    script = (_s, reply) => {
+      reply({ type: "response.created", response: { id: "resp-a1" } });
+      reply({ type: "response.output_item.done", item: { type: "reasoning", summary: [], encrypted_content: "x" } });
+      releaseA = () => {
+        reply({
+          type: "response.output_item.done",
+          item: { type: "message", role: "assistant", content: [{ type: "output_text", text: "a1" }] },
+        });
+        reply({ type: "response.completed", response: { id: "resp-a1", usage: {} } });
+      };
+    };
+    const turnA = await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("u1")], headers: {}, conversationKey: CONVO_A });
+    const drainedA = drain(turnA!);
+
+    // Session B (conversation B): the SAME content, so its baseline ends up byte-identical to
+    // A's -- exactly the "content-identical prefix, different conversation" case the finding
+    // describes. A is still busy, so this is forced onto a brand-new socket.
+    script = msgScript("resp-b1", "a1");
+    await drain(
+      (await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("u1")], headers: {}, conversationKey: CONVO_B }))!,
+    );
+    expect(socketsOpened).toBe(2);
+
+    releaseA!();
+    await drainedA;
+
+    // A request continuing conversation B, extending its baseline by one item. Session A (pool
+    // index 0, created first) has an EQUAL-length, content-identical baseline, so a bare
+    // first-match-wins scan with no identity check would return A instead of B.
+    script = msgScript("resp-b2", "ignored");
+    const t3 = await runCodexWsTurn({
+      shellBody: SHELL,
+      input: [userMsg("u1"), assistantEcho("a1"), userMsg("u2")],
+      headers: {},
+      conversationKey: CONVO_B,
+    });
+    await drain(t3!);
+
+    expect(t3!.incremental).toBe(true);
+    // Must chain onto B's response id, never A's -- resuming A would inherit A's hidden
+    // server-side state (e.g. reasoning) under conversation B's identity.
+    expect(sentPayloads[sentPayloads.length - 1].previous_response_id).toBe("resp-b1");
+    expect(socketsOpened).toBe(2); // resumed an existing socket; did not open a third
+  });
+
+  it("prefers the longest matching baseline over a shorter one earlier in pool order", async () => {
+    const CONVO_X = "convo-x-shared";
+
+    // S1 (conversation X): baseline [u1, a1].
+    script = msgScript("resp-x1", "a1");
+    await drain(
+      (await runCodexWsTurn({ shellBody: SHELL, input: [userMsg("u1")], headers: {}, conversationKey: CONVO_X }))!,
+    );
+
+    // Resume S1 with a turn that will be ABANDONED after response.failed. Per the documented
+    // .return()-skips-the-commit-block behaviour (see the response.incomplete/failed regression
+    // tests above), S1 goes back to the pool FREE but with its baseline UNCHANGED at [u1, a1] --
+    // and, crucially, still BUSY until that abandonment runs, which is what forces the next turn
+    // below onto a brand-new socket instead of resuming S1.
+    let sendKbFailure: (() => void) | null = null;
+    script = (_s, reply) => {
+      reply({ type: "response.created", response: { id: "resp-kb" } });
+      reply({ type: "response.output_item.done", item: { type: "reasoning", summary: [], encrypted_content: "x" } });
+      sendKbFailure = () => reply({ type: "response.failed", response: { id: "resp-kb", error: { message: "nope" } } });
+    };
+    const turnKb = await runCodexWsTurn({
+      shellBody: SHELL,
+      input: [userMsg("u1"), assistantEcho("a1"), userMsg("marker")],
+      headers: {},
+      conversationKey: CONVO_X,
+    });
+    expect(turnKb).not.toBeNull();
+
+    // While S1 is busy on the turn above, a second request for the SAME conversation has nothing
+    // free to resume and opens S2 fresh, with a full send that grows to baseline length 4.
+    script = msgScript("resp-x2", "a2");
+    const t2 = await runCodexWsTurn({
+      shellBody: SHELL,
+      input: [userMsg("u1"), assistantEcho("a1"), userMsg("u2")],
+      headers: {},
+      conversationKey: CONVO_X,
+    });
+    await drain(t2!);
+    expect(socketsOpened).toBe(2);
+
+    // Now let S1's held turn fail and be abandoned, returning S1 to the pool free, still at its
+    // ORIGINAL length-2 baseline (pool order: S1 first, S2 second; S2's baseline is longer).
+    sendKbFailure!();
+    await expect(
+      (async () => {
+        for await (const ev of turnKb!.events) {
+          if (ev.type === "response.failed") throw new Error("failed");
+        }
+      })(),
+    ).rejects.toThrow();
+
+    // The deciding turn: both S1 (len 2) and S2 (len 4) are valid strict prefixes of this
+    // request. Pool order alone would return S1 (checked first); the fix must return S2, the
+    // longest match, sending the smallest correct delta.
+    script = msgScript("resp-x3", "a3");
+    const t4 = await runCodexWsTurn({
+      shellBody: SHELL,
+      input: [userMsg("u1"), assistantEcho("a1"), userMsg("u2"), assistantEcho("a2"), userMsg("u3")],
+      headers: {},
+      conversationKey: CONVO_X,
+    });
+    await drain(t4!);
+
+    const sent = sentPayloads[sentPayloads.length - 1];
+    expect(sent.previous_response_id).toBe("resp-x2");
+    expect(sent.input).toEqual([{ type: "message", role: "user", content: [{ type: "input_text", text: "u3" }] }]);
+    expect(socketsOpened).toBe(2); // resumed an existing socket; did not open a third
   });
 });

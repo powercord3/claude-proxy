@@ -125,10 +125,82 @@ type Baseline = {
   // means this is a different request shape and the delta would be answered against the wrong
   // context, so we resend in full.
   shell: string;
+  // Review finding: which logical conversation this baseline belongs to (conversationKey() in
+  // codex-oauth.ts). An IDENTITY guard, checked alongside -- never instead of -- the content
+  // prefix check in findResumable. See the comment above the session pool for why content alone
+  // is not enough.
+  conversationKey: string;
 };
 
 function canon(item: unknown): string {
   return JSON.stringify(item);
+}
+
+/**
+ * Whether `raw` (a JSON text) contains a bare integer literal outside the range a JS double can
+ * hold exactly. `JSON.parse` -> `JSON.stringify` silently rounds such a literal (`9007199254740993`
+ * round-trips to `9007199254740992`), so two DIFFERENT raw arguments strings can canonicalize to
+ * the SAME text and compare equal -- see the review finding on canonicalizeArguments. Walks the
+ * raw text by hand rather than using JSON.parse's own tokens, because parsing is exactly the step
+ * that has already thrown the precision away by the time a reviver would see a value.
+ *
+ * Deliberately conservative: string contents are skipped (a big digit run inside a quoted value
+ * is not a number), but anything under-recognised outside a string reports `true` rather than
+ * `false`, since a false "unsafe" only costs a resend and a false "safe" is the bug this exists
+ * to prevent.
+ */
+function hasUnsafeNumericLiteral(raw: string): boolean {
+  let inString = false;
+  let i = 0;
+  const n = raw.length;
+  while (i < n) {
+    const c = raw[i];
+    if (inString) {
+      if (c === "\\") {
+        i += 2;
+        continue;
+      }
+      if (c === '"') inString = false;
+      i += 1;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      i += 1;
+      continue;
+    }
+    if (c === "-" || (c >= "0" && c <= "9")) {
+      const start = i;
+      if (c === "-") i += 1;
+      while (i < n && raw[i] >= "0" && raw[i] <= "9") i += 1;
+      let isFloatOrExp = false;
+      if (raw[i] === ".") {
+        isFloatOrExp = true;
+        i += 1;
+        while (i < n && raw[i] >= "0" && raw[i] <= "9") i += 1;
+      }
+      if (raw[i] === "e" || raw[i] === "E") {
+        isFloatOrExp = true;
+        i += 1;
+        if (raw[i] === "+" || raw[i] === "-") i += 1;
+        while (i < n && raw[i] >= "0" && raw[i] <= "9") i += 1;
+      }
+      if (!isFloatOrExp) {
+        const token = raw.slice(start, i);
+        try {
+          const value = BigInt(token);
+          if (value > BigInt(Number.MAX_SAFE_INTEGER) || value < BigInt(Number.MIN_SAFE_INTEGER)) {
+            return true;
+          }
+        } catch {
+          return true; // could not evaluate the token -- refuse to vouch for it
+        }
+      }
+      continue;
+    }
+    i += 1;
+  }
+  return false;
 }
 
 /**
@@ -138,9 +210,18 @@ function canon(item: unknown): string {
  * refuse a whole delta, so both sides of the comparison are canonicalized through parse+
  * stringify before being compared. A string that fails to parse is left unchanged rather than
  * dropped -- an item we cannot canonicalize should still compare literally, not disappear.
+ *
+ * Review finding: parse+stringify is not lossless for an integer literal outside
+ * Number.MAX_SAFE_INTEGER -- both sides can round to the SAME (wrong) value and compare equal
+ * while the server's actual recorded arguments differ, silently corrupting the delta. When
+ * `hasUnsafeNumericLiteral` reports that risk, canonicalization is skipped and the raw string is
+ * compared literally instead; two calls that are truly identical still compare equal (their raw
+ * text is byte-identical), and two that merely LOOK equal after double-rounding now correctly
+ * compare unequal, costing a full resend instead of a corrupted chain.
  */
 function canonicalizeArguments(raw: unknown): unknown {
   if (typeof raw !== "string") return raw;
+  if (hasUnsafeNumericLiteral(raw)) return raw;
   try {
     return JSON.stringify(JSON.parse(raw));
   } catch {
@@ -212,12 +293,30 @@ function classifyOutputItem(item: Record<string, unknown>): OutputClassification
 
 // ── Session pool ─────────────────────────────────────────────────────────────
 //
-// Sessions are matched by CONTENT, not by prompt_cache_key. The cache key is shared globally on
-// this host by design (CODEX-COST-WORK-2.md section 2 measures a shared key as *helping*
-// caching), so keying a stateful chain by it would let one agent's conversation continue
-// another's. Matching on "is this session's baseline a prefix of the request I am about to
-// send" cannot make that mistake: a session only ever continues the conversation it actually
-// holds.
+// Sessions are matched primarily by CONTENT, not by prompt_cache_key. The cache key is shared
+// globally on this host by design (CODEX-COST-WORK-2.md section 2 measures a shared key as
+// *helping* caching), so keying a stateful chain by IT would let one agent's conversation
+// continue another's. Matching on "is this session's baseline a prefix of the request I am about
+// to send" does not make that particular mistake: a session only ever continues a request whose
+// visible content it could plausibly have produced.
+//
+// It can still resume the WRONG session, though. Review finding: two sessions can hold
+// content-identical baselines while the server's own hidden state differs, because `reasoning`
+// and `web_search_call` items are deliberately omitted from the baseline (see
+// classifyOutputItem's doc comment) -- e.g. session A holds `[u1,a1]` and session B holds
+// `[u1,a1,u2,a2]`; a request continuing conversation B's chain matches BOTH as a strict prefix,
+// and pool order alone could return A, sending B's delta against A's `previous_response_id` and
+// silently inheriting A's reasoning context. So `findResumable` also requires the caller-supplied
+// `conversationKey` to match -- an IDENTITY guard checked ALONGSIDE the content-prefix check, not
+// instead of it: content is still what decides how much of the delta is safe to send, and the
+// longest qualifying match wins (see bestCandidateSession below) so the smallest correct delta is
+// chosen among sessions that pass both checks.
+//
+// `conversationKey` is NOT `prompt_cache_key`. Unlike the cache key, it is not shared globally by
+// design -- it is derived per logical conversation (`conversationKey()` in codex-oauth.ts) and
+// exists ONLY to disambiguate sessions whose visible baseline content happens to collide; the
+// paragraph above about a shared key helping caching does not apply to it, and it plays no role
+// in cache routing.
 
 type Session = {
   socket: CodexSocket;
@@ -477,6 +576,13 @@ export type CodexWsParams = {
   input: ResponseItem[];
   /** Headers the HTTPS path would have sent, minus Content-Type/Accept/OpenAI-Beta. */
   headers: Record<string, string>;
+  /**
+   * Identifies which logical conversation this turn belongs to (`conversationKey()` in
+   * codex-oauth.ts). NOT the same thing as `prompt_cache_key` -- see the session-pool comment
+   * above for why the two must not be conflated. Required so `findResumable` cannot cross-resume
+   * two conversations whose visible baseline content happens to collide.
+   */
+  conversationKey: string;
 };
 
 function shellHashOf(shellBody: Record<string, unknown>): string {
@@ -484,13 +590,19 @@ function shellHashOf(shellBody: Record<string, unknown>): string {
 }
 
 /**
- * Find a session whose baseline is a strict prefix of `itemCanons`, so this turn can be sent as
- * a delta against it.
+ * Find a session whose baseline is a strict prefix of `itemCanons`, belonging to the SAME
+ * conversation, so this turn can be sent as a delta against it. Among every session that
+ * qualifies, prefers the LONGEST matching baseline: it is the most specific match and sends the
+ * smallest delta (review finding: pool order alone could return a shorter, also-valid prefix
+ * held by an unrelated conversation).
  */
-function findResumable(itemCanons: string[], shell: string): Session | null {
+function findResumable(itemCanons: string[], shell: string, conversationKey: string): Session | null {
+  let best: Session | null = null;
+  let bestLen = -1;
   for (const s of sessions) {
     if (s.busy || s.closed || !s.baseline) continue;
     if (s.baseline.shell !== shell) continue;
+    if (s.baseline.conversationKey !== conversationKey) continue;
     const base = s.baseline.items;
     if (base.length > itemCanons.length) continue;
     let ok = true;
@@ -500,16 +612,32 @@ function findResumable(itemCanons: string[], shell: string): Session | null {
         break;
       }
     }
-    if (ok) return s;
+    if (ok && base.length > bestLen) {
+      bestLen = base.length;
+      best = s;
+    }
   }
-  return null;
+  return best;
 }
 
+/**
+ * Review finding: a free socket with a useful chain was being handed out on plain pool order,
+ * so two concurrent conversations would routinely wipe each other's baselines (the caller nulls
+ * it on a mismatch) and fall back to full resends even though a perfectly good prefix baseline
+ * existed elsewhere in the pool. Prefer a free session that has nothing to lose -- no baseline at
+ * all -- and only reach for one that does, picking the least-recently-used, when every free
+ * session is currently carrying a chain. A cost fix, not a correctness fix: findResumable is what
+ * decides whether a chain may be reused; this only decides which chain is sacrificed when a fresh
+ * one must be started.
+ */
 function takeFreeSession(): Session | null {
+  let lru: Session | null = null;
   for (const s of sessions) {
-    if (!s.busy && !s.closed) return s;
+    if (s.busy || s.closed) continue;
+    if (!s.baseline) return s;
+    if (!lru || s.lastUsedAt < lru.lastUsedAt) lru = s;
   }
-  return null;
+  return lru;
 }
 
 // Fix E: findResumable returning null used to mean the caller only ever logged "ws turn full",
@@ -582,7 +710,7 @@ export async function runCodexWsTurn(params: CodexWsParams): Promise<CodexWsTurn
   const shell = shellHashOf(params.shellBody);
   const itemCanons = params.input.map((item) => canonItem(item as unknown as Record<string, unknown>));
 
-  let session = findResumable(itemCanons, shell);
+  let session = findResumable(itemCanons, shell, params.conversationKey);
   let incremental = false;
   let deltaItems: ResponseItem[] = params.input;
   let previousResponseId: string | null = null;
@@ -841,6 +969,7 @@ export async function runCodexWsTurn(params: CodexWsParams): Promise<CodexWsTurn
           items: [...itemCanons, ...serverEcho],
           previousResponseId: responseId,
           shell,
+          conversationKey: params.conversationKey,
         };
       } else {
         active.baseline = null;
@@ -851,7 +980,25 @@ export async function runCodexWsTurn(params: CodexWsParams): Promise<CodexWsTurn
       active.onDrop = null;
       active.onReasonUpgrade = null;
       active.lastUsedAt = Date.now();
-      if (failure) closeSession(active, failure);
+      // Review finding (CRITICAL): `finished` is set ONLY by a terminal frame for THIS response
+      // -- `response.completed` / `response.failed` / `response.incomplete` (via the queue-push
+      // branches above) or a genuine transport drop via onDrop, both of which also set `failure`
+      // unless the completion was clean. If this turn's generator is unwinding with `finished`
+      // still false, nothing terminal for THIS response has been observed: the consumer walked
+      // away mid-stream (client disconnect, Esc, an abort calling `.return()` on the generator),
+      // and the upstream response may still be streaming. `socket.onmessage` dispatches every
+      // frame to whatever `onFrame` is installed with no response-id check, so returning this
+      // socket to the pool would hand the next turn's `onFrame` the abandoned response's late
+      // frames -- including its eventual `response.completed`, which would commit a baseline
+      // pairing the NEW turn's items with the OLD response's id. Closing the socket instead is
+      // cheap; do not try to keep it alive by draining stray frames or matching response ids.
+      //
+      // This cannot false-positive on an ordinary completion: `yield first` and every
+      // `yield queue.shift()` for a terminal event happen AFTER `finished` was already set by the
+      // frame handler above, so a `.return()` triggered by the consumer processing that very
+      // event (see the response.incomplete/response.failed tests) still resumes with
+      // `finished === true` and takes the ordinary `if (failure)` branch instead.
+      if (failure || !finished) closeSession(active, failure ?? "turn abandoned before its response terminated");
     }
   }
 
