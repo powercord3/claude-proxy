@@ -29,6 +29,7 @@ import {
 import { writePid, registerCleanup } from "../bin/lib/pid-manager.js";
 import { recordFailure } from "./incident-log.js";
 import { recordServed, CompletionTap } from "./served-log.js";
+import { benchRewriteUrl, benchContextOf, benchFields, parseDirectModel } from "./bench-tag.js";
 import { fallbackChain, laneUnavailableReason } from "./fallbacks.js";
 import { laneBelievedDown, laneDownSignalCount, laneHealth } from "./provider-health.js";
 import { startLaneProbes } from "./lane-probe.js";
@@ -97,7 +98,9 @@ let active: ProviderModel | null = defaultProvider && defaultModel
   ? { provider: defaultProvider, model: defaultModel }
   : null;
 
-const fastify = Fastify({ logger: false, bodyLimit: 100 * 1024 * 1024 });
+// rewriteUrl strips a /bench/<run_tag>/[direct/] prefix so bench traffic routes exactly like
+// normal traffic; the parsed run context rides on the raw request (bench-tag.ts, S-T12).
+const fastify = Fastify({ logger: false, bodyLimit: 100 * 1024 * 1024, rewriteUrl: benchRewriteUrl });
 
 
 // startedAt captured at module load = process birth time
@@ -392,20 +395,39 @@ fastify.post("/v1/messages", async (req, res) => {
   try {
     const body = req.body as AnthropicRequest;
     const defaults = active ?? undefined;
+    // Bench run context from the /bench/<run_tag>/[direct/] prefix (bench-tag.ts, S-T12).
+    const bench = benchContextOf(req.raw);
+    const transportOnly = bench?.direct === true;
     // Resolve against the alias rather than the client's string when this is a classifier
     // request AND the user has defined somewhere to send it. body.model is deliberately left
     // alone: it is logged below as what the client asked for, and rewriting it would erase the
-    // only evidence that the reroute happened.
+    // only evidence that the reroute happened. Never in transport-only mode: the stock arm
+    // must be served the id it named.
     const rerouted =
-      isPermissionClassifier(body) && userShortcutDefined(CLASSIFIER_ALIAS);
+      !transportOnly && isPermissionClassifier(body) && userShortcutDefined(CLASSIFIER_ALIAS);
     const modelField = rerouted ? CLASSIFIER_ALIAS : body.model;
-    let { provider, model, reasoning, serviceTier } = parseProviderModel(modelField, defaults);
+    let provider: ProviderModel["provider"];
+    let model: string;
+    let reasoning: ProviderModel["reasoning"];
+    let serviceTier: ProviderModel["serviceTier"];
+    if (transportOnly) {
+      // Stock arm (bench PLAN.md §2.4): no alias expansion, no defaults; a trailing @effort on
+      // the direct id is carried as reasoning, never left inside the upstream model slug.
+      const direct = parseDirectModel(body.model);
+      if ("error" in direct) throw apiError(400, direct.error);
+      provider = direct.provider as ProviderModel["provider"];
+      model = direct.model;
+      reasoning = direct.reasoning as ProviderModel["reasoning"];
+    } else {
+      ({ provider, model, reasoning, serviceTier } = parseProviderModel(modelField, defaults));
+    }
 
     // Fallback chain for this alias (fallbacks.ts). The pristine copy is taken BEFORE any
     // adapter prep below mutates the body, so every later hop starts from what the client
     // sent. `displayModel` is what the primary would have echoed; a hop rewrites its reply's
     // model field to it so the client sees the same name whichever target answered.
-    const chainTargets = fallbackChain(modelField).map((t) => ({
+    // Transport-only mode has no chain: a hop would serve a model the stock arm did not ask for.
+    const chainTargets = (transportOnly ? [] : fallbackChain(modelField)).map((t) => ({
       spec: t,
       target: parseProviderModel(t, defaults),
     }));
@@ -459,12 +481,13 @@ fastify.post("/v1/messages", async (req, res) => {
     console.log(`[ccx] REQUEST: model="${body.model}"${via} → provider="${provider}" model="${model}"${reasoning ? ` reasoning=${reasoning}` : ""}${serviceTier ? ` serviceTier=${serviceTier}` : ""}${inbound} | tools=[${tools}] system=${hasSystem} messages=${msgCount} stream=${body.stream === true ? "true" : "false"}`);
 
     const servedStart = Date.now();
+    const benchExtra = benchFields(bench, req.headers as Record<string, unknown>);
     const servedId = recordServed({
       requested: body.model, provider, model, reasoning, serviceTier, inEffort,
       stream: body.stream === true, headers: req.headers as Record<string, unknown>,
-      rerouted, fallbackHop: chainIdx,
+      rerouted, fallbackHop: chainIdx, extra: benchExtra,
     });
-    if (servedId) new CompletionTap(servedId, servedStart).attach(res.raw);
+    if (servedId) new CompletionTap(servedId, servedStart, Date.now, benchExtra).attach(res.raw);
 
     // Claude Code 2.1.268's server-side threads ("tether") send only the NEW messages on a
     // continue, trusting the server to already hold the earlier turns. Only the real Anthropic
