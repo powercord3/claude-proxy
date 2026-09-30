@@ -1393,6 +1393,7 @@ type StreamState = {
   toolCalls: number;
   inputTokens: number;
   outputTokens: number;
+  reasoningTokens: number;
   cacheCreationInputTokens: number;
   cacheReadInputTokens: number;
   stopReason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "ccx_stream_aborted";
@@ -1436,6 +1437,7 @@ function makeState(p0: P0Correlate): StreamState {
     toolCalls: 0,
     inputTokens: 0,
     outputTokens: 0,
+    reasoningTokens: 0,
     cacheCreationInputTokens: 0,
     cacheReadInputTokens: 0,
     stopReason: "end_turn",
@@ -1651,6 +1653,8 @@ function finalize(res: FastifyReply, s: StreamState, model: string) {
     usage: {
       input_tokens: s.inputTokens,
       output_tokens: s.outputTokens,
+      // Non-Anthropic field read by served-log.ts (Responses output_tokens_details.reasoning_tokens).
+      reasoning_tokens: s.reasoningTokens,
       cache_creation_input_tokens: s.cacheCreationInputTokens,
       cache_read_input_tokens: s.cacheReadInputTokens,
     },
@@ -1821,6 +1825,7 @@ function handleEvent(
             usage?: {
               input_tokens?: number;
               output_tokens?: number;
+              output_tokens_details?: { reasoning_tokens?: number };
               input_tokens_details?: { cached_tokens?: number };
             };
             end_turn?: boolean;
@@ -1834,6 +1839,7 @@ function handleEvent(
         );
         s.inputTokens = inputUsage.inputTokens;
         s.outputTokens = u.output_tokens ?? 0;
+        s.reasoningTokens = u.output_tokens_details?.reasoning_tokens ?? 0;
         s.cacheReadInputTokens = inputUsage.cacheReadInputTokens;
       }
       // P0.5 backend canary: log whether the unverified prompt_cache_diagnostics field (see

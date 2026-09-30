@@ -1,12 +1,15 @@
 // Durable per-request record of which model actually served a request.
-// One JSON line per /v1/messages request in ~/.claude-proxy/served.jsonl, written at the point
-// the alias has resolved to provider:model@effort. Fail-open: any error is swallowed.
-// Usage tokens are not recorded here (the response path is per-adapter); ts+request_id let a
-// follow-up line be joined later.
+// Two JSON lines per /v1/messages request in ~/.claude-proxy/served.jsonl, joined by request_id:
+//   1. the request line, written where the alias has resolved to provider:model@effort;
+//   2. a kind:"completion" line, written when the reply closes: usage, reasoning tokens,
+//      timings, stop_reason and HTTP status.
+// Fail-open: any error is swallowed. Only counters are kept; prompt and response text are
+// parsed and discarded, never stored or logged.
 import { appendFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { randomUUID } from "crypto";
+import { StringDecoder } from "string_decoder";
 
 const STATE_DIR = join(homedir(), ".claude-proxy");
 const SERVED_LOG_PATH = process.env.CCX_SERVED_LOG || join(STATE_DIR, "served.jsonl");
@@ -46,11 +49,194 @@ export function buildServedLine(r: ServedRecord, now: Date = new Date()): Record
   };
 }
 
-export function recordServed(r: ServedRecord): void {
+function appendLine(line: Record<string, unknown>): void {
   try {
     mkdirSync(STATE_DIR, { recursive: true });
-    appendFileSync(SERVED_LOG_PATH, JSON.stringify(buildServedLine(r)) + "\n");
+    appendFileSync(SERVED_LOG_PATH, JSON.stringify(line) + "\n");
   } catch {
     /* fail-open: logging must never break a request */
+  }
+}
+
+/** Writes the request line and returns its request_id (null only if building it failed). */
+export function recordServed(r: ServedRecord): string | null {
+  try {
+    const line = buildServedLine(r);
+    appendLine(line);
+    return line.request_id as string;
+  } catch {
+    return null;
+  }
+}
+
+type Usage = Record<string, any>;
+const MAX_BUFFER = 4 * 1024 * 1024;
+
+/**
+ * Observes the Anthropic-shaped reply every adapter writes to `raw` (SSE for streams, one JSON
+ * body otherwise) and appends the completion line when the reply closes.
+ */
+export class CompletionTap {
+  private decoder = new StringDecoder("utf8");
+  private pending = "";
+  private sawSse = false;
+  private jsonBuf = "";
+  private jsonOverflow = false;
+  private usage: Usage = {};
+  private stopReason: string | null = null;
+  private thinkingChars = 0;
+  private firstTokenAt: number | null = null;
+  private lastTokenAt: number | null = null;
+  private done = false;
+
+  constructor(
+    private requestId: string,
+    private startMs: number,
+    private now: () => number = Date.now,
+  ) {}
+
+  /** Patch raw.write/raw.end to observe output; the completion line is emitted on close. */
+  attach(raw: any): void {
+    try {
+      const write = raw.write.bind(raw);
+      const end = raw.end.bind(raw);
+      raw.write = (chunk: any, ...rest: any[]) => {
+        this.feed(chunk);
+        return write(chunk, ...rest);
+      };
+      raw.end = (chunk?: any, ...rest: any[]) => {
+        if (chunk != null && typeof chunk !== "function") this.feed(chunk);
+        return end(chunk, ...rest);
+      };
+      raw.once("close", () => this.finish(raw.statusCode, raw.writableFinished === true));
+    } catch {
+      /* fail-open */
+    }
+  }
+
+  feed(chunk: any): void {
+    try {
+      if (chunk == null) return;
+      const t = this.now();
+      const text = typeof chunk === "string" ? chunk : this.decoder.write(Buffer.from(chunk));
+      if (!this.sawSse && this.pending === "" && this.jsonBuf === "" && /^\s*(event|data):/.test(text)) {
+        this.sawSse = true;
+      }
+      if (this.sawSse) {
+        this.pending += text;
+        let i: number;
+        while ((i = this.pending.indexOf("\n")) >= 0) {
+          const ln = this.pending.slice(0, i).replace(/\r$/, "");
+          this.pending = this.pending.slice(i + 1);
+          if (ln.startsWith("data:")) this.onData(ln.slice(5).trim(), t);
+        }
+        if (this.pending.length > MAX_BUFFER) this.pending = "";
+      } else if (!this.jsonOverflow) {
+        this.jsonBuf += text;
+        if (this.jsonBuf.length > MAX_BUFFER) {
+          this.jsonOverflow = true;
+          this.jsonBuf = "";
+        }
+      }
+    } catch {
+      /* fail-open */
+    }
+  }
+
+  private mergeUsage(u: Usage | undefined): void {
+    if (!u || typeof u !== "object") return;
+    for (const [k, v] of Object.entries(u)) {
+      if (k === "cache_creation" && v && typeof v === "object") {
+        this.usage.cache_creation = { ...this.usage.cache_creation, ...(v as object) };
+      } else if (typeof v === "number") {
+        this.usage[k] = v;
+      }
+    }
+  }
+
+  private onData(data: string, t: number): void {
+    if (!data || data === "[DONE]") return;
+    let j: any;
+    try {
+      j = JSON.parse(data);
+    } catch {
+      return;
+    }
+    switch (j?.type) {
+      case "message_start":
+        this.mergeUsage(j.message?.usage);
+        break;
+      case "content_block_delta": {
+        if (this.firstTokenAt === null) this.firstTokenAt = t;
+        this.lastTokenAt = t;
+        const d = j.delta;
+        if (d?.type === "thinking_delta" && typeof d.thinking === "string") this.thinkingChars += d.thinking.length;
+        break;
+      }
+      case "message_delta":
+        this.mergeUsage(j.usage);
+        if (j.delta?.stop_reason) this.stopReason = j.delta.stop_reason;
+        break;
+    }
+  }
+
+  private parseJsonBody(): void {
+    if (this.sawSse || this.jsonOverflow || !this.jsonBuf) return;
+    try {
+      const j = JSON.parse(this.jsonBuf);
+      this.mergeUsage(j?.usage);
+      if (typeof j?.stop_reason === "string") this.stopReason = j.stop_reason;
+      for (const b of Array.isArray(j?.content) ? j.content : []) {
+        if (b?.type === "thinking" && typeof b.thinking === "string") this.thinkingChars += b.thinking.length;
+      }
+    } catch {
+      /* error bodies and the like */
+    }
+  }
+
+  buildLine(status: number | undefined, finished: boolean): Record<string, unknown> {
+    this.parseJsonBody();
+    const end = this.now();
+    const u = this.usage;
+    const out = typeof u.output_tokens === "number" ? u.output_tokens : null;
+    const ttft = this.firstTokenAt !== null ? this.firstTokenAt - this.startMs : null;
+    // Generation time: first token to end of reply; output_tokens / that is decode throughput.
+    const genMs = this.firstTokenAt !== null ? end - this.firstTokenAt : null;
+    const reported = typeof u.reasoning_tokens === "number" ? u.reasoning_tokens : null;
+    const estimate = reported === null && this.thinkingChars > 0;
+    return {
+      kind: "completion",
+      ts: new Date(end).toISOString(),
+      request_id: this.requestId,
+      start_ts: new Date(this.startMs).toISOString(),
+      http_status: status ?? null,
+      finished,
+      stop_reason: this.stopReason,
+      usage: {
+        input_tokens: u.input_tokens ?? null,
+        cache_read_input_tokens: u.cache_read_input_tokens ?? null,
+        cache_creation_input_tokens: u.cache_creation_input_tokens ?? null,
+        ephemeral_5m_input_tokens: u.cache_creation?.ephemeral_5m_input_tokens ?? null,
+        ephemeral_1h_input_tokens: u.cache_creation?.ephemeral_1h_input_tokens ?? null,
+        output_tokens: out,
+      },
+      reasoning_tokens: reported,
+      reasoning_tokens_est: estimate ? Math.ceil(this.thinkingChars / 4) : null,
+      reasoning_tokens_is_estimate: estimate,
+      time_to_first_token_ms: ttft,
+      total_ms: end - this.startMs,
+      output_tokens_per_s:
+        out !== null && genMs !== null && genMs > 0 ? Math.round((out / (genMs / 1000)) * 100) / 100 : null,
+    };
+  }
+
+  finish(status: number | undefined, finished: boolean): void {
+    if (this.done) return;
+    this.done = true;
+    try {
+      appendLine(this.buildLine(status, finished));
+    } catch {
+      /* fail-open */
+    }
   }
 }

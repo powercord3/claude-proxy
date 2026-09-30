@@ -28,7 +28,7 @@ import {
 } from "./openai-auth.js";
 import { writePid, registerCleanup } from "../bin/lib/pid-manager.js";
 import { recordFailure } from "./incident-log.js";
-import { recordServed } from "./served-log.js";
+import { recordServed, CompletionTap } from "./served-log.js";
 import { fallbackChain, laneUnavailableReason } from "./fallbacks.js";
 import { laneBelievedDown, laneDownSignalCount, laneHealth } from "./provider-health.js";
 import { startLaneProbes } from "./lane-probe.js";
@@ -458,11 +458,13 @@ fastify.post("/v1/messages", async (req, res) => {
     // mistake as reading `in:effort` as proof of the effort the model ran at.
     console.log(`[ccx] REQUEST: model="${body.model}"${via} → provider="${provider}" model="${model}"${reasoning ? ` reasoning=${reasoning}` : ""}${serviceTier ? ` serviceTier=${serviceTier}` : ""}${inbound} | tools=[${tools}] system=${hasSystem} messages=${msgCount} stream=${body.stream === true ? "true" : "false"}`);
 
-    recordServed({
+    const servedStart = Date.now();
+    const servedId = recordServed({
       requested: body.model, provider, model, reasoning, serviceTier, inEffort,
       stream: body.stream === true, headers: req.headers as Record<string, unknown>,
       rerouted, fallbackHop: chainIdx,
     });
+    if (servedId) new CompletionTap(servedId, servedStart).attach(res.raw);
 
     // Claude Code 2.1.268's server-side threads ("tether") send only the NEW messages on a
     // continue, trusting the server to already hold the earlier turns. Only the real Anthropic
