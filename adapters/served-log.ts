@@ -26,6 +26,8 @@ export interface ServedRecord {
   headers?: Record<string, unknown>;
   rerouted?: boolean;
   fallbackHop?: number;
+  /** Extra fields stamped onto the line, e.g. the bench run tag (bench-tag.ts, S-T12). */
+  extra?: Record<string, unknown>;
 }
 
 export function buildServedLine(r: ServedRecord, now: Date = new Date()): Record<string, unknown> {
@@ -46,7 +48,29 @@ export function buildServedLine(r: ServedRecord, now: Date = new Date()): Record
     stream: r.stream === true,
     rerouted: r.rerouted === true,
     fallback_hop: r.fallbackHop ?? -1,
+    ...(r.extra ?? {}),
   };
+}
+
+// Last resolution seen per requested alias, so the line after a repoint names the change
+// (bench PLAN.md S-T03: the record must name the alias change, not just the new model).
+// In-memory: the first request after a proxy restart has no previous value to compare.
+const lastResolved = new Map<string, string>();
+
+/** Adds alias_changed / previous_resolved when `requested` now resolves differently. */
+export function noteAliasChange(line: Record<string, unknown>, r: ServedRecord): void {
+  // A fallback hop or classifier reroute changes the target for reasons other than a repoint.
+  if (r.rerouted === true || (r.fallbackHop ?? -1) >= 0) return;
+  if (typeof r.requested !== "string" || r.requested === "") return;
+  const resolved = line.resolved as string;
+  if (resolved === r.requested) return; // not an alias: nothing was resolved
+  const key = r.requested.toLowerCase();
+  const prev = lastResolved.get(key);
+  lastResolved.set(key, resolved);
+  if (prev !== undefined && prev !== resolved) {
+    line.alias_changed = true;
+    line.previous_resolved = prev;
+  }
 }
 
 function appendLine(line: Record<string, unknown>): void {
@@ -62,6 +86,7 @@ function appendLine(line: Record<string, unknown>): void {
 export function recordServed(r: ServedRecord): string | null {
   try {
     const line = buildServedLine(r);
+    noteAliasChange(line, r);
     appendLine(line);
     return line.request_id as string;
   } catch {
@@ -93,6 +118,8 @@ export class CompletionTap {
     private requestId: string,
     private startMs: number,
     private now: () => number = Date.now,
+    /** Fields repeated on the completion line, e.g. run_tag (S-T12). */
+    private extra: Record<string, unknown> = {},
   ) {}
 
   /** Patch raw.write/raw.end to observe output; the completion line is emitted on close. */
@@ -227,6 +254,7 @@ export class CompletionTap {
       total_ms: end - this.startMs,
       output_tokens_per_s:
         out !== null && genMs !== null && genMs > 0 ? Math.round((out / (genMs / 1000)) * 100) / 100 : null,
+      ...this.extra,
     };
   }
 
