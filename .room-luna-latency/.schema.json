@@ -1,0 +1,44 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "argument",
+    "staged_plan",
+    "disagreements",
+    "wants_another_round"
+  ],
+  "properties": {
+    "argument": {
+      "type": "string",
+      "description": "Your reasoning this round, in markdown. Argue; do not ratify."
+    },
+    "staged_plan": {
+      "type": "string",
+      "description": "The COMPLETE plan as you would have it, in markdown \u2014 not a diff and not commentary. If you would leave it unchanged, return it unchanged."
+    },
+    "disagreements": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "One line each. Specific points you dispute, most important first."
+    },
+    "wants_another_round": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "yes",
+        "because"
+      ],
+      "properties": {
+        "yes": {
+          "type": "boolean"
+        },
+        "because": {
+          "type": "string",
+          "description": "A further round is justified only by NEW EVIDENCE, a CONCRETE COUNTEREXAMPLE, or a BOUNDED FALSIFIABLE PROPOSAL \u2014 and it must be something the NEXT round would carry, not what you just delivered. Remaining disagreement is not a reason. Name which of the three you hold, or say you hold none."
+        }
+      }
+    }
+  }
+}

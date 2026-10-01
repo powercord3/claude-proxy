@@ -3,6 +3,7 @@ import { readFile, writeFile, unlink, mkdir } from "fs/promises";
 import { join } from "path";
 import { tmpdir, homedir } from "os";
 import { spawn, execSync, ChildProcess } from "child_process";
+import { findPortPids } from "../bin/lib/pid-manager.js";
 
 // ── Helpers (replicated from proxy-launcher.js for test isolation) ────
 
@@ -71,8 +72,8 @@ describe("launcher decision logic", () => {
     const PORT = 18990;
     const rootDir = join(import.meta.dirname!, "..");
     const proxy = spawn(
-      "npx",
-      ["tsx", join(rootDir, "adapters", "anthropic-gateway.ts")],
+      process.execPath,
+      [join(rootDir, "node_modules", "tsx", "dist", "cli.mjs"), join(rootDir, "adapters", "anthropic-gateway.ts")],
       {
         cwd: rootDir,
         env: { ...process.env, CLAUDE_PROXY_PORT: String(PORT), CCX_DEFAULT_PROVIDER: "codex-oauth", CCX_DEFAULT_MODEL: "gpt-5.3-codex" },
@@ -163,8 +164,8 @@ describe("provider-agnostic routing", () => {
   it("proxy started with codex-oauth default still has all routes available", async () => {
     const rootDir = join(import.meta.dirname!, "..");
     proxy = spawn(
-      "npx",
-      ["tsx", join(rootDir, "adapters", "anthropic-gateway.ts")],
+      process.execPath,
+      [join(rootDir, "node_modules", "tsx", "dist", "cli.mjs"), join(rootDir, "adapters", "anthropic-gateway.ts")],
       {
         cwd: rootDir,
         env: {
@@ -205,11 +206,13 @@ describe("provider-agnostic routing", () => {
   }, 15000);
 });
 
-describe("killPortOccupant (lsof-based cleanup)", () => {
-  it("lsof finds process on a known port", async () => {
-    // Start a simple server to occupy a port, then verify lsof can find it
+describe("killPortOccupant (port-occupant discovery)", () => {
+  it("finds the process listening on a known port", async () => {
+    // Start a simple server to occupy a port, then verify findPortPids sees it.
+    // Exercises the real helper rather than shelling out to lsof directly, so
+    // the assertion holds on Windows (netstat) as well as Unix (lsof).
     const PORT = 18994;
-    const server = spawn("node", ["-e", `
+    const server = spawn(process.execPath, ["-e", `
       require("http").createServer((q,s) => s.end("ok")).listen(${PORT}, "127.0.0.1", () => {
         process.stdout.write("ready");
       });
@@ -224,12 +227,8 @@ describe("killPortOccupant (lsof-based cleanup)", () => {
         setTimeout(resolve, 3000);
       });
 
-      // Verify lsof can find it
-      let pids = "";
-      try {
-        pids = execSync(`lsof -ti:${PORT}`, { encoding: "utf-8" }).trim();
-      } catch {}
-      expect(pids).not.toBe("");
+      const pids = findPortPids(PORT);
+      expect(pids.length).toBeGreaterThan(0);
       expect(pids).toContain(String(server.pid));
     } finally {
       server.kill("SIGTERM");

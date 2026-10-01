@@ -58,7 +58,7 @@ alias claude-codex="node ~/claude-proxy/bin/claude-codex.js"
 
 | Command | Default model | Auth |
 | --- | --- | --- |
-| `claude-codex` | `codex-oauth:gpt-5.6-sol@high` | ChatGPT/Codex OAuth, or existing Codex CLI tokens |
+| `claude-codex` | `codex-oauth:gpt-6-sol@high` | ChatGPT/Codex OAuth, or existing Codex CLI tokens |
 | `claude-gemini` | `gemini-oauth:gemini-3.1-pro-preview` | Google OAuth |
 | `claude-cline` | `cline-pass:glm-5.2` | Cline subscription (token read from the Cline app) |
 | `ccx` | `glm:glm-5.2` | API keys in `~/.claude-proxy/.env` |
@@ -83,9 +83,9 @@ Routes Claude Code to OpenAI's ChatGPT/Codex backend. The GPT-5.6 family shares 
 
 | Shortcut | Model | Role |
 | --- | --- | --- |
-| `sol` · `codex` · `cx` | `gpt-5.6-sol` | Frontier — hardest coding & research (**default**) |
+| `sol` · `codex` · `cx` | `gpt-6-sol` | Frontier — hardest coding & research (**default**) |
 | `terra` | `gpt-5.6-terra` | Balanced — everyday, high-volume work |
-| `luna` | `gpt-5.6-luna` | Fast & affordable — routine tasks |
+| `luna` | `gpt-6-luna` | Fast & affordable — routine tasks |
 | `gpt55` | `gpt-5.5` | Previous frontier (272k window) |
 
 Tokens are looked up in `~/.claude-proxy/codex-oauth.json`, then
@@ -199,15 +199,15 @@ window; Sol and the other GPT-5.6 models default to **High**.
 
 | Shortcut | Route |
 | --- | --- |
-| `sol` · `codex` · `cx` · `gpt56` · `gpt-5.6-sol` | `gpt-5.6-sol@high` |
+| `sol` · `codex` · `cx` · `gpt56` · `gpt6` · `gpt-5.6-sol` · `gpt-6-sol` | `gpt-6-sol@high` |
 | `terra` · `gpt-5.6-terra` | `gpt-5.6-terra` |
-| `luna` · `gpt-5.6-luna` | `gpt-5.6-luna` |
+| `luna` · `gpt-5.6-luna` · `gpt-6-luna` | `gpt-6-luna` |
 | `gpt55` · `gpt-5.5` | `gpt-5.5` (272k window) |
-| `fast` | `gpt-5.6-sol@low` |
-| `smart` | `gpt-5.6-sol@medium` |
-| `deep` | `gpt-5.6-sol@high` |
-| `xhigh` · `extra` | `gpt-5.6-sol@xhigh` |
-| `max` · `think` | `gpt-5.6-sol@max` |
+| `fast` | `gpt-6-sol@low` |
+| `smart` | `gpt-6-sol@medium` |
+| `deep` | `gpt-6-sol@high` |
+| `xhigh` · `extra` | `gpt-6-sol@xhigh` |
+| `max` · `think` | `gpt-6-sol@max` |
 
 All route through `codex-oauth:`. Append `@level` to override effort on any
 model — `/model terra@max`, `/model luna@high`, `/model sol@low`.

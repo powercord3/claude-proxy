@@ -1,0 +1,10 @@
+{
+  "topic": "Why luna@max runs ~4x slower than opus@medium through the proxy on an identical agentic task, and which of the measured overheads are fixable",
+  "cap": 4,
+  "round": 2,
+  "members": [
+    "agent-partner"
+  ],
+  "sessions": {},
+  "repo": "C:\\Users\\hhi04\\.claude-proxy-src"
+}

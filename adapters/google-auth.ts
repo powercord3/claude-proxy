@@ -567,6 +567,18 @@ export async function googleLogout(account = 1): Promise<void> {
 
 // ── HTML pages ─────────────────────────────────────────────────────────
 
+// Escape untrusted values before interpolating them into HTML. These pages
+// render OAuth query parameters and upstream error text on a loopback origin
+// that is same-origin with the proxy's credentialed API routes.
+function esc(value: unknown): string {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function successPage(email?: string, projectId?: string): string {
   return `<!DOCTYPE html>
 <html><head><title>Login Successful</title></head>
@@ -574,8 +586,8 @@ function successPage(email?: string, projectId?: string): string {
 <div style="text-align:center;color:#e2e8f0;max-width:500px;">
   <div style="font-size:48px;margin-bottom:16px;">&#10003;</div>
   <h1 style="color:#4ade80;margin:0 0 12px;">Authenticated Successfully</h1>
-  <p>Logged in as: <strong>${email || "unknown"}</strong></p>
-  ${projectId ? `<p>Code Assist Project: <code style="background:#1e293b;padding:2px 8px;border-radius:4px;">${projectId}</code></p>` : `<p style="color:#94a3b8;">No Code Assist project (using standard API)</p>`}
+  <p>Logged in as: <strong>${esc(email || "unknown")}</strong></p>
+  ${projectId ? `<p>Code Assist Project: <code style="background:#1e293b;padding:2px 8px;border-radius:4px;">${esc(projectId)}</code></p>` : `<p style="color:#94a3b8;">No Code Assist project (using standard API)</p>`}
   <p style="color:#64748b;margin-top:24px;">You can close this window and return to your terminal.<br>Use <code style="background:#1e293b;padding:2px 8px;border-radius:4px;">go:gemini-3.1-pro-preview</code> as your model.</p>
 </div>
 </body></html>`;
@@ -588,7 +600,7 @@ function errorPage(message: string): string {
 <div style="text-align:center;color:#e2e8f0;max-width:500px;">
   <div style="font-size:48px;margin-bottom:16px;">&#10007;</div>
   <h1 style="color:#f87171;margin:0 0 12px;">Authentication Failed</h1>
-  <p>${message}</p>
+  <p>${esc(message)}</p>
   <p style="color:#64748b;margin-top:24px;">Please try again at <a href="/google/login" style="color:#60a5fa;">/google/login</a></p>
 </div>
 </body></html>`;

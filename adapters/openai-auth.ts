@@ -506,6 +506,18 @@ export async function handleCodexOAuthCallback(
 
 // ── HTML pages ────────────────────────────────────────────────────────
 
+// Escape untrusted values before interpolating them into HTML. These pages
+// render OAuth query parameters and upstream error text on a loopback origin
+// that is same-origin with the proxy's credentialed API routes.
+function esc(value: unknown): string {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function codexSuccessPage(email?: string, plan?: string): string {
   return `<!DOCTYPE html>
 <html><head><title>Login Successful</title></head>
@@ -513,8 +525,8 @@ function codexSuccessPage(email?: string, plan?: string): string {
 <div style="text-align:center;color:#e2e8f0;max-width:500px;">
   <div style="font-size:48px;margin-bottom:16px;">&#10003;</div>
   <h1 style="color:#4ade80;margin:0 0 12px;">OpenAI Authenticated</h1>
-  <p>Logged in as: <strong>${email || "unknown"}</strong></p>
-  <p>Plan: <strong style="color:#a78bfa;">${plan || "unknown"}</strong></p>
+  <p>Logged in as: <strong>${esc(email || "unknown")}</strong></p>
+  <p>Plan: <strong style="color:#a78bfa;">${esc(plan || "unknown")}</strong></p>
   <p style="color:#64748b;margin-top:24px;">You can close this window.<br>Use <code style="background:#1e293b;padding:2px 8px;border-radius:4px;">codex</code> as your model in Claude Code.</p>
 </div>
 </body></html>`;
@@ -527,7 +539,7 @@ function codexErrorPage(message: string): string {
 <div style="text-align:center;color:#e2e8f0;max-width:500px;">
   <div style="font-size:48px;margin-bottom:16px;">&#10007;</div>
   <h1 style="color:#f87171;margin:0 0 12px;">Authentication Failed</h1>
-  <p>${message}</p>
+  <p>${esc(message)}</p>
   <p style="color:#64748b;margin-top:24px;">Please try again at <a href="/codex/login" style="color:#60a5fa;">/codex/login</a></p>
 </div>
 </body></html>`;

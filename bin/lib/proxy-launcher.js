@@ -89,7 +89,14 @@ export async function launchProxy({
 
     // Step 3: Start a new proxy
     const proxyLog = join(homedir(), ".claude-proxy", "proxy.log");
-    const proxy = spawn("npx", ["tsx", join(rootDir, "adapters", "anthropic-gateway.ts")], {
+    // Run tsx's JS entry point with the current node binary instead of going
+    // through npx. On Windows, spawn() cannot resolve the extensionless "npx"
+    // shell script (ENOENT), and since Node 18.20/20.12 spawning "npx.cmd"
+    // without shell:true throws EINVAL. shell:true would fix both but would put
+    // an interpolated path through cmd.exe. Invoking node directly sidesteps
+    // all three and removes the npx dependency.
+    const tsxCli = join(rootDir, "node_modules", "tsx", "dist", "cli.mjs");
+    const proxy = spawn(process.execPath, [tsxCli, join(rootDir, "adapters", "anthropic-gateway.ts")], {
       cwd: rootDir,
       env: {
         ...process.env,

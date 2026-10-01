@@ -51,7 +51,7 @@
   "dependencies": {
     "dotenv": "^16.6.1",
     "eventsource-parser": "^3.0.0",
-    "fastify": "^4.29.1"
+    "fastify": "^5.11.2"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",

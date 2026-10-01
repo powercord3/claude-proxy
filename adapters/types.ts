@@ -50,12 +50,23 @@ export type AnthropicRequest = {
   metadata?: { user_id?: string };
 };
 
-export type ProviderKey = "openai" | "openrouter" | "gemini" | "gemini-oauth" | "codex-oauth" | "glm" | "anthropic" | "cline-pass";
+export type ProviderKey = "openai" | "openrouter" | "gemini" | "gemini-oauth" | "codex-oauth" | "glm" | "anthropic" | "cline-pass" | "deepseek";
 
 export type ReasoningLevel = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+// Codex "fast mode" — the `service_tier` field on the Responses body. Orthogonal to
+// ReasoningLevel: effort buys more thinking, this buys the same thinking sooner.
+//
+// The wire value is "priority", NOT "fast". "Fast" is only the display name: the model
+// catalog at ~/.codex/models_cache.json lists `service_tiers: [{id: "priority", name:
+// "Fast", description: "1.5x speed, increased usage"}]`, and the API docs note that GPT-5.6
+// and earlier echo back `priority` whichever spelling was sent. Accept both on input for the
+// sake of anyone typing what the docs' example shows, and normalise to the id.
+export type ServiceTier = "priority";
 
 export type ProviderModel = {
   provider: ProviderKey;
   model: string;
   reasoning?: ReasoningLevel;
+  serviceTier?: ServiceTier;
 };

@@ -502,7 +502,8 @@ function reasoningEffort(level?: ReasoningLevel): "low" | "medium" | "high" | "x
   if (level) return level; // low | medium | high | xhigh | max pass straight through
   // Codex maps its client-only "ultra" effort to "max" on the wire (multi-agent
   // orchestration is a CLI concern, not a Responses param), so "max" is the ceiling
-  // the proxy ever sends. GPT-5.6 Sol/Terra/Luna accept it; older models cap at xhigh.
+  // the proxy ever sends. GPT-6 Sol/Luna and GPT-5.6 Sol/Terra/Luna accept it; older
+  // models cap at xhigh.
   const env = (process.env.CODEX_REASONING_EFFORT || "").toLowerCase();
   if (env === "low" || env === "medium" || env === "high" || env === "xhigh" || env === "max") return env;
   return "high";
@@ -773,14 +774,14 @@ function countTextOnlyAssistantTurns(messages: AnthropicMessage[]): number {
 //
 // Which models accept a service tier, read off the account's own catalog at
 // ~/.codex/models_cache.json (`service_tiers: [{id:"priority", name:"Fast"}]`). Every
-// GPT-5.6 variant, plus 5.5 and 5.4, carry it; `gpt-5.4-mini` carries an empty list, which
-// is the reason this is a check and not an assumption.
+// GPT-6 and GPT-5.6 variant, plus 5.5 and 5.4, carry it; `gpt-5.4-mini` carries an empty
+// list, which is the reason this is a check and not an assumption.
 //
 // Matched on prefix so a dated snapshot ("gpt-5.6-sol-2026-08-01") inherits its family. A
 // model missing from the table is left at standard rather than guessed into fast mode: the
 // downside of a wrong guess is an upstream 400 on every request from that slot, against a
 // saving of one line in this table when a new model ships.
-const SERVICE_TIER_MODELS = ["gpt-5.6", "gpt-5.5", "gpt-5.4"];
+const SERVICE_TIER_MODELS = ["gpt-6", "gpt-5.6", "gpt-5.5", "gpt-5.4"];
 
 function supportsServiceTier(model: string): boolean {
   const lc = model.toLowerCase();
@@ -845,6 +846,26 @@ function classifyCodexStreamFailure(text: string): string | null {
  * "try again shortly" signal as any other transient upstream error - only a 400/401/403 means
  * the server rejected the credentials themselves.
  */
+/**
+ * The usage_limit_reached body names when the quota comes back:
+ *   {"error":{"type":"usage_limit_reached",...,"resets_at":1789366062,"resets_in_seconds":9510}}
+ * resets_at is unix SECONDS. Falls back to resets_in_seconds when only that is present.
+ * Undefined for any body that is not JSON or names neither - the health record then simply
+ * has no reset time, which is the pre-existing behaviour.
+ */
+export function parseCodexResetsAt(text: string, now = Date.now()): Date | undefined {
+  try {
+    const err = JSON.parse(text)?.error;
+    const at = Number(err?.resets_at);
+    if (Number.isFinite(at) && at > 0) return new Date(at * 1000);
+    const inSec = Number(err?.resets_in_seconds);
+    if (Number.isFinite(inSec) && inSec >= 0) return new Date(now + inSec * 1000);
+  } catch {
+    // not JSON - no reset time
+  }
+  return undefined;
+}
+
 function isCodexAuthUnrecoverable(message: string): boolean {
   if (/not logged in to openai/i.test(message)) return true;
   const m = /token refresh failed \((\d+)\)/i.exec(message);
@@ -860,12 +881,20 @@ export async function chatCodexOAuth(
   apiKey?: string,
   reasoning?: ReasoningLevel,
   serviceTier?: ServiceTier,
+  /**
+   * Set by the gateway only when the alias has a fallback chain (fallbacks.ts). Returns true
+   * while nothing has reached the client yet; the error is then RETHROWN so the gateway can
+   * try the next target, instead of being rendered into the reply as SSE text. Once output
+   * has started it returns false and the error is surfaced in-stream exactly as before.
+   */
+  fallbackArmed?: () => boolean,
 ) {
   try {
     await chatCodexOAuthInner(res, body, model, apiKey, reasoning, serviceTier);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[codex] ERROR: ${message}`);
+    if (fallbackArmed?.()) throw err;
     emitErrorAsSse(res, model, message);
   }
 }
@@ -1326,7 +1355,14 @@ async function chatCodexOAuthInner(
   if (!upstream.ok || !upstream.body) {
     const text = await upstream.text().catch(() => "<no-body>");
     const reason = classifyCodexUpstreamError(upstream.status, text);
-    if (reason) markLaneDown(lane, reason, text);
+    if (reason) {
+      markLaneDown(
+        lane,
+        reason,
+        text,
+        reason === "codex-quota" ? parseCodexResetsAt(text) : undefined,
+      );
+    }
     throw new Error(`OpenAI ${upstream.status}: ${text.slice(0, 500)}`);
   }
 

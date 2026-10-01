@@ -224,6 +224,9 @@ export async function chatClinePass(
     return await streamOpenAICompatible(res, body, {
       ...opts,
       headers: { Authorization: `Bearer ${token}` },
+      // A 401 here has one more chance below before it means anything - don't let it mark
+      // the lane down yet.
+      authMayRetry: true,
     });
   } catch (e: any) {
     // If the upstream rejected the token and we haven't streamed anything yet,
@@ -231,6 +234,7 @@ export async function chatClinePass(
     if (e?.statusCode === 401 && !res.raw.headersSent) {
       console.warn("[cline-pass] Upstream 401 — forcing token refresh and retrying once.");
       token = await forceRefreshClineToken();
+      // This is the last attempt - a 401/403 here is terminal and belongs in health.
       return await streamOpenAICompatible(res, body, {
         ...opts,
         headers: { Authorization: `Bearer ${token}` },

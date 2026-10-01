@@ -110,9 +110,34 @@ Compare the same shape in work order #2 section 1.3: ~110,365 full-price input p
 
 ---
 
+### 1.4 Live on 17870 since 2026-09-06 16:52
+
+Restarted and confirmed serving. First live traffic, `luna@max`, 8-turn sequential-read loop,
+run twice:
+
+```
+             wall    median TTFT   full-price input   cache reads
+luna@max A   18.5s        2,308ms             45,291       215,040
+luna@max B   27.1s        2,779ms             45,391       215,040
+```
+
+Per-turn full-price input after the opening document is ~3,000 tokens and `cacheRead` climbs
+monotonically, 3,712 → 28,288 → 31,360 → 33,408 → 35,456 → 38,528 → 40,576. No collapse. Work
+order #2 section 1.3 measured the same lane at ~110,365 full-price input **per turn** with the
+climb collapsing to the preamble mid-run.
+
+The INCREMENTAL ratio that open item 2 says to watch is healthy on real traffic: **14 incremental
+turns to 3 full**, and all 3 full turns are the legitimate opening turn of a conversation. The
+deepest turn uploaded 7.7 KiB where the HTTPS path would have uploaded 106.9 KiB.
+
+The two runs differ by 100 tokens of full-price input and are identical on cache reads, which is
+the same zero-variance signature as section 1.2. Wall clock is the noisy axis, not cost.
+
+---
+
 ## 2. What is on disk
 
-**Live behaviour is unchanged until the proxy on 17870 restarts.** Nothing here is running yet.
+Committed as `4933441` and **live on 17870 since the 16:52 restart**.
 
 - `adapters/providers/codex-ws.ts` — new. The transport. Connection pool, content-addressed
   session matching, delta calculation, and the fallback contract. Read its header comment for the

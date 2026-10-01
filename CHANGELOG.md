@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] — 2026-09-22
+
+### Changed
+- **Sol and Luna moved to GPT-6.** Verified live against the codex-oauth backend: `gpt-6-sol` and `gpt-6-luna` are accepted at low/medium/high/xhigh/max effort and with `!fast`; `gpt-6-terra` does not exist (backend 400 "model is not supported"). `sol`/`codex`/`cx`/`gpt56` and `luna` now resolve to `gpt-6-sol@high` / `gpt-6-luna`; `terra` stays on `gpt-5.6-terra`. The old `gpt-5.6-sol` / `gpt-5.6-luna` shortcut keys keep working (they now point at the GPT-6 slugs), and new `gpt6` / `gpt-6-sol` / `gpt-6-luna` keys were added to match. `SERVICE_TIER_MODELS` (fast-mode gating) now also matches the `gpt-6` prefix.
+
 ## [2.0.0] — 2026-07-10
 
 ### Added

@@ -162,8 +162,8 @@ describe("gateway healthz integration", () => {
   it("healthz returns pid and startedAt", async () => {
     const rootDir = join(import.meta.dirname!, "..");
     proxy = spawn(
-      "npx",
-      ["tsx", join(rootDir, "adapters", "anthropic-gateway.ts")],
+      process.execPath,
+      [join(rootDir, "node_modules", "tsx", "dist", "cli.mjs"), join(rootDir, "adapters", "anthropic-gateway.ts")],
       {
         cwd: rootDir,
         env: { ...process.env, CLAUDE_PROXY_PORT: String(PORT) },
@@ -200,8 +200,8 @@ describe("gateway healthz integration", () => {
   it("healthz response is self-consistent across calls", async () => {
     const rootDir = join(import.meta.dirname!, "..");
     proxy = spawn(
-      "npx",
-      ["tsx", join(rootDir, "adapters", "anthropic-gateway.ts")],
+      process.execPath,
+      [join(rootDir, "node_modules", "tsx", "dist", "cli.mjs"), join(rootDir, "adapters", "anthropic-gateway.ts")],
       {
         cwd: rootDir,
         env: { ...process.env, CLAUDE_PROXY_PORT: String(PORT) },

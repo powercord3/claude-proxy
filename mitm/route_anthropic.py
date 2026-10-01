@@ -1,0 +1,343 @@
+"""Route Claude Code's inference through claude-proxy while leaving Remote Control intact.
+
+WHY THIS EXISTS. Remote Control refuses to start when ANTHROPIC_BASE_URL names
+any host other than api.anthropic.com -- the check is `new URL(v).host` against
+a one-entry allowlist, so the extension's way of reaching claude-proxy (setting
+that variable to 127.0.0.1:17870) is exactly what disqualifies a session. But
+the CLI honours HTTPS_PROXY for Anthropic API traffic, and the gate never reads
+it. So a forward proxy can reroute inference while ANTHROPIC_BASE_URL stays
+unset and the session still counts as first-party.
+
+Verified against claude 2.1.224 before this was written:
+  - HTTPS_PROXY pointed at a dead port kills inference (so it IS honoured),
+    while the same command with no HTTPS_PROXY returns normally (so that is a
+    real failure and not a broken probe).
+  - `claude remote-control` with HTTPS_PROXY set advances past the base-URL
+    gate to the workspace-trust check.
+
+WHAT IS INTERCEPTED, AND WHAT DELIBERATELY IS NOT.
+
+Only `POST /v1/messages` on api.anthropic.com is redirected to the local
+gateway. That is not a simplification -- it is the entire Anthropic-compatible
+surface anthropic-gateway.ts actually serves. Its other routes are /healthz,
+/_status and the OAuth callbacks; there is no handler for anything else under
+/v1. Two consequences worth stating out loud, because both fail quietly:
+
+  - /v1/messages/count_tokens must NOT be routed here. It looks like it belongs
+    with /v1/messages and the gateway would 404 it, which surfaces as odd
+    context accounting rather than an obvious error.
+  - /v1/code/* is Remote Control's own control plane. The bridge session and
+    inference share a hostname, so anything that captures api.anthropic.com
+    captures the control plane too. Sending it to the gateway would break the
+    feature this whole file exists to preserve.
+
+Everything else -- every other host on the machine -- is not intercepted at
+all. `allow_hosts` restricts decryption to the one host below, so nothing else
+is presented a certificate or even opened. Keeping the blast radius to a single
+path on a single host is the point of the design, not an optimisation.
+
+`allow_hosts` rather than `ignore_hosts`, for a reason worth recording: the
+first version of this file used `ignore_hosts` with a negative lookahead,
+`^(?!api\.anthropic\.com:443$)`. mitmproxy matches that pattern against "the ip
+or the hostname" -- WITHOUT the port -- so for "api.anthropic.com" the lookahead
+succeeded and the one host we exist to intercept was the one host tunnelled
+blind. It failed silently: requests completed normally against the real API, the
+addon's hooks never ran, and inference looked fine. The only tell was the
+absence of a routed request in the gateway log. Prefer the option that states
+the intent positively; a negated pattern that is wrong looks exactly like
+success here.
+
+Run:
+  mitmdump --listen-host 127.0.0.1 --listen-port 17871 -s mitm/route_anthropic.py
+
+Then, for the session that should be proxied (and ONLY that session):
+  HTTPS_PROXY=http://127.0.0.1:17871
+  NODE_EXTRA_CA_CERTS=<mitmproxy CA>
+  ANTHROPIC_BASE_URL must stay UNSET -- setting it re-breaks Remote Control.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+
+from mitmproxy import ctx, http
+
+#: The one host whose TLS we terminate. Anything else is blind-tunnelled.
+TARGET_HOST = "api.anthropic.com"
+
+#: claude-proxy's existing gateway. Untouched by this file -- we hand requests
+#: to it exactly as the extension does, so all alias/lane routing is reused
+#: rather than reimplemented.
+GATEWAY_HOST = "127.0.0.1"
+GATEWAY_PORT = 17870
+
+#: Exact paths the gateway serves. Compared after stripping the query string,
+#: and matched exactly rather than by prefix -- see the count_tokens note above.
+ROUTED_PATHS = frozenset({"/v1/messages"})
+
+#: The only host mitmproxy is permitted to decrypt. Matched against the ip or
+#: hostname; the optional port keeps it correct if a future version includes it.
+ALLOW_ONLY_TARGET = r"^api\.anthropic\.com(:443)?$"
+
+#: Durable, unbuffered evidence of what this addon actually did. mitmdump's
+#: stdout is block-buffered when redirected to a file, which during development
+#: produced a completely empty log for a process that was running fine -- an
+#: absent record read as "nothing was routed" when it only meant "nothing was
+#: flushed". Route the addon's own findings somewhere that cannot lie by
+#: omission.
+LOG_PATH = os.path.join(
+    os.path.expanduser("~"), ".claude-proxy", "mitm-route.log"
+)
+
+logger = logging.getLogger("route_anthropic")
+
+
+def _attach_file_log() -> None:
+    if any(isinstance(h, logging.FileHandler) for h in logger.handlers):
+        return
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    handler = logging.FileHandler(LOG_PATH, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    # Without this the record also propagates to mitmproxy's own termlog, which
+    # is fine, but the file is the copy we actually read back.
+    logger.propagate = True
+
+
+def load(loader) -> None:
+    _attach_file_log()
+    ctx.options.allow_hosts = [ALLOW_ONLY_TARGET]
+
+
+def running() -> None:
+    logger.info(
+        "route_anthropic active: POST /v1/messages on %s -> http://%s:%d ; all else passes through",
+        TARGET_HOST,
+        GATEWAY_HOST,
+        GATEWAY_PORT,
+    )
+
+
+def http_connect(flow: http.HTTPFlow) -> None:
+    """Log every CONNECT, including hosts we deliberately do NOT decrypt.
+
+    `allow_hosts` keeps decryption to api.anthropic.com, so every other host is
+    blind-tunnelled and invisible to `request`/`responseheaders`. That is the
+    right blast radius but it makes one question unanswerable from this log:
+    when an expected call is simply absent, was it never made, or was it made
+    somewhere we cannot see? CONNECT is observed before the tunnel decision, so
+    logging it here separates those two cases.
+    """
+    logger.info("connect %s", flow.request.host_header or flow.request.pretty_host)
+
+
+def error(flow: http.HTTPFlow) -> None:
+    """Log a flow that died before completing.
+
+    The gap this closes: a request that is attempted and then torn down at the
+    connection layer never reaches the `request` hook, so it is indistinguishable
+    in this log from one that was never made at all. A long-lived subscribe is
+    exactly the shape of request that fails that way.
+    """
+    path = getattr(flow.request, "path", "?").split("?", 1)[0] if flow.request else "?"
+    logger.info("ERROR %s %s -- %s", getattr(flow.request, "method", "?"), path, flow.error)
+
+
+#: ALPN offered by the one component whose TLS stack refuses our certificate.
+#: Remote Control's inbound event stream is opened by a client that advertises
+#: http/1.1 explicitly and then walks away from the handshake; the Node stack
+#: that carries inference and the rest of the control plane offers no ALPN at
+#: all and accepts the certificate normally. Measured 2026-08-12: 3/3 http/1.1
+#: connections failed, 7/7 empty-ALPN connections succeeded.
+#:
+#: DISABLED BY DEFAULT since 2026-08-12. The discriminator stopped discriminating: Claude
+#: Code's inference client now advertises http/1.1 as well, so it matches this rule and gets
+#: tunnelled straight past the gateway. The docstring below called that shot exactly --
+#: `routed /v1/messages` lines stop appearing -- and that is what was observed: last routed
+#: line 20:47:49, against 95 passthrough decisions the same day, ramping to 70 in one hour.
+#:
+#: The consequence is worth stating plainly, because only half of it is visible. Tunnelled
+#: inference still WORKS for real model names, because it reaches the real API -- so the
+#: session looks healthy. What breaks is every name that exists only at the gateway: the
+#: `housekeeping` alias (which is what WebSearch and WebFetch resolve through) and every
+#: `agent-*` alias, so all subagent spawns fail with "issue with the selected model".
+#:
+#: Set CCX_MITM_PASSTHROUGH_ALPN=http/1.1 to restore the old behaviour. That is the Remote
+#: Control trade: with the rule ON, Remote Control's event stream completes and aliases die;
+#: with it OFF, aliases work and Remote Control's inbound stream may not. They cannot both
+#: hold while the two components are indistinguishable at the ClientHello, which is the only
+#: point where this decision can still be made -- SNI and ALPN are all that exist there, and
+#: both components now present the same pair.
+PASSTHROUGH_ALPN = frozenset(
+    tag.strip().encode()
+    for tag in os.environ.get("CCX_MITM_PASSTHROUGH_ALPN", "").split(",")
+    if tag.strip()
+)
+
+
+NEWLINE = chr(10)
+
+
+def tls_clienthello(data) -> None:
+    """Tunnel the connections whose client will not trust our certificate.
+
+    Installing the mitmproxy CA into the Windows root store did not help, which
+    is the evidence that this client trusts neither the OS store nor
+    NODE_EXTRA_CA_CERTS -- the signature of a native HTTP stack carrying its own
+    compiled-in root list. Nothing on the proxy side can make such a client
+    accept an interception certificate, so the only way its traffic completes is
+    for us not to intercept it.
+
+    That costs nothing here. The gateway only ever needs POST /v1/messages, and
+    the connections being tunnelled carry Remote Control's control plane, which
+    this file already passes through untouched at the HTTP layer. Tunnelling
+    moves that same decision one layer earlier, to the point where it can still
+    be acted on.
+
+    The discriminator is ALPN, and it is worth stating what makes it a real one
+    rather than a criterion that matches everything: BOTH classes are populated
+    and they behave oppositely -- empty-ALPN connections succeed and carry the
+    inference this router exists to reroute, http/1.1 connections fail without
+    exception. If that ever stops being true the failure is visible rather than
+    silent: `routed /v1/messages` lines stop appearing, because inference would
+    be tunnelling straight past the gateway.
+    """
+    hello = getattr(data, "client_hello", None)
+    sni = getattr(hello, "sni", None)
+    alpn = set(getattr(hello, "alpn_protocols", None) or [])
+
+    if sni == TARGET_HOST and alpn & PASSTHROUGH_ALPN:
+        data.ignore_connection = True
+        logger.info("passthrough (untrusting client) sni=%s alpn=%s", sni, sorted(alpn))
+
+
+def _tls_detail(data) -> str:
+    """Pull the parts of a failed handshake that identify WHOSE it was.
+
+    The connection repr alone names a port and nothing else, which cannot be
+    correlated with anything. The SNI says which host was being reached and
+    `conn.error` says why the peer walked away -- an untrusted certificate and
+    an ALPN mismatch are both 'handshake failed' from the outside, and they have
+    completely different fixes.
+    """
+    conn = getattr(data, "conn", None)
+    return (
+        f"sni={getattr(conn, 'sni', None)} "
+        f"alpn={getattr(conn, 'alpn', None)} "
+        f"err={getattr(conn, 'error', None)} "
+        f"peer={getattr(conn, 'peername', None)}"
+    )
+
+
+def tls_failed_client(data) -> None:
+    logger.info("TLS-FAIL client %s", _tls_detail(data))
+
+
+def tls_failed_server(data) -> None:
+    logger.info("TLS-FAIL server %s", _tls_detail(data))
+
+
+def websocket_start(flow: http.HTTPFlow) -> None:
+    """Record a WebSocket handshake on the one host we decrypt.
+
+    Worth its own hook because a WebSocket is the obvious thing an inbound
+    channel would move to if it stopped being SSE, and it would otherwise show
+    up as nothing more than a GET that never returns.
+    """
+    logger.info("websocket %s", flow.request.path.split("?", 1)[0])
+
+
+def responseheaders(flow: http.HTTPFlow) -> None:
+    """Stream response bodies instead of buffering them.
+
+    mitmproxy buffers a response body in full and only forwards it once the
+    server closes the body -- `HttpStream.state_wait_for_response_headers`
+    takes the streaming branch ONLY when `flow.response.stream` is truthy
+    (proxy/layers/http/__init__.py, `elif self.flow.response.stream and not
+    event.end_stream`). Nothing sets it by default: `stream_large_bodies` is
+    unset, and it would not help here anyway since an event stream is chunked
+    and `check_body_size` bails out when the expected size is unknown.
+
+    That is fatal for exactly one flow, and it is the one Remote Control uses
+    to hear from the phone. `GET /v1/code/sessions/<cse>/worker/events/stream`
+    is a Server-Sent Events channel the server holds open for ~5 minutes and
+    pushes inbound user messages down. Buffered, every event sits in mitmproxy
+    until that 5-minute stream is torn down, so the bridge registers, heartbeats
+    and presence all succeed -- they are short request/response calls -- while
+    the session appears to simply never receive what was typed.
+
+    Streaming is set for any event-stream response rather than for that one
+    path, because the routed POST /v1/messages inference calls are SSE too:
+    buffered, they deliver in one lump at the end instead of token by token.
+    """
+    if flow.response is None:
+        return
+
+    content_type = flow.response.headers.get("content-type", "")
+    if "text/event-stream" not in content_type.lower():
+        return
+
+    flow.response.stream = True
+    logger.info("streaming %s (%s)", flow.request.path.split("?", 1)[0], content_type)
+
+
+#: Records what the control plane ANSWERS, not just what was asked -- the
+#: request-time log cannot tell a 200 carrying an inbound message from a 4xx
+#: that made the client give up, and both look like silence from the session's
+#: side. Left in place but OFF: it writes response bodies to disk, which is more
+#: than a permanently-running log should hold. Flip it on to diagnose, not to run.
+DIAGNOSE_CONTROL_PLANE = False
+
+#: Bodies are truncated rather than logged whole. The interesting part of a
+#: heartbeat answer is whether it carries anything at all.
+BODY_PREVIEW_BYTES = 600
+
+
+def response(flow: http.HTTPFlow) -> None:
+    if not DIAGNOSE_CONTROL_PLANE or flow.response is None:
+        return
+    if flow.request.pretty_host != TARGET_HOST:
+        return
+
+    path = flow.request.path.split("?", 1)[0]
+    if not path.startswith("/v1/code/"):
+        return
+
+    # A streamed response has no buffered body here by construction, so asking
+    # for one would be misleading rather than merely empty.
+    if flow.response.stream:
+        logger.info("reply %s %s <streamed>", flow.response.status_code, path)
+        return
+
+    body = flow.response.content or b""
+    preview = body[:BODY_PREVIEW_BYTES].decode("utf-8", "replace").replace("\n", " ")
+    logger.info(
+        "reply %s %s len=%d %s",
+        flow.response.status_code,
+        path,
+        len(body),
+        preview,
+    )
+
+
+def request(flow: http.HTTPFlow) -> None:
+    if flow.request.pretty_host != TARGET_HOST:
+        return
+
+    # Strip the query before comparing. A path arrives as "/v1/messages?beta=1"
+    # often enough that matching the raw value would silently stop routing.
+    path = flow.request.path.split("?", 1)[0]
+
+    if flow.request.method != "POST" or path not in ROUTED_PATHS:
+        # Passes through to the real Anthropic API. This is the branch that
+        # carries Remote Control's /v1/code/* control plane, so it must stay
+        # the default rather than a listed exception.
+        logger.info("pass-through %s %s", flow.request.method, path)
+        return
+
+    flow.request.scheme = "http"
+    flow.request.host = GATEWAY_HOST
+    flow.request.port = GATEWAY_PORT
+    logger.info("routed %s -> gateway :%d", path, GATEWAY_PORT)

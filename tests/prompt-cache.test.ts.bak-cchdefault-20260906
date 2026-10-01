@@ -1,0 +1,535 @@
+// Tests for the B1 (`prompt_cache_key` affinity) and B2 (per-turn reasoning identity) fixes
+// described in PROMPT-CACHE-WORK.md sections 4 and 5. `codex-reasoning-cache.ts` is the unit
+// under test; the env-flag gate that chooses between `conversationKey` and `promptCacheKeyFor`
+// lives in codex-oauth.ts and is covered separately in codex-oauth.test.ts.
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "crypto";
+import {
+  conversationKey,
+  firstUserHashDiagnostics,
+  promptCacheKeyFor,
+  reasoningKeyForCallIds,
+  stripLeadingSystemReminders,
+  threadIdFor,
+} from "../adapters/codex-reasoning-cache.js";
+import {
+  cchNormalizedForWire,
+  codexSessionHeadersEnabled,
+  diffBlockSignatures,
+  isPromptCacheKeyV2Enabled,
+  normalizeCchForWire,
+} from "../adapters/providers/codex-oauth.js";
+import type { SystemBlockSignature } from "../adapters/providers/codex-oauth.js";
+import type { AnthropicMessage } from "../adapters/types.js";
+
+describe("stripLeadingSystemReminders", () => {
+  it("strips a single well-formed leading reminder block", () => {
+    expect(stripLeadingSystemReminders("<system-reminder>hello</system-reminder>\nreal text")).toBe(
+      "real text",
+    );
+  });
+
+  it("tolerates whitespace before and between reminder blocks", () => {
+    const text =
+      "  \n<system-reminder>one</system-reminder>\n\n  <system-reminder>two</system-reminder>\n\nreal prompt A";
+    expect(stripLeadingSystemReminders(text)).toBe("real prompt A");
+  });
+
+  it("stops at the first thing that is not a closed reminder block", () => {
+    const text = "<system-reminder>ok</system-reminder>\nthe actual user message";
+    expect(stripLeadingSystemReminders(text)).toBe("the actual user message");
+  });
+
+  it("stops at an unclosed leading reminder tag instead of guessing where it would have ended", () => {
+    const text = "<system-reminder>this block never closes\nmore text that looks real";
+    // Under-stripping is the safe failure here: the whole malformed-and-after text stays in
+    // the hash basis rather than risking eating real conversation text past a guessed end.
+    expect(stripLeadingSystemReminders(text)).toBe(text);
+  });
+
+  it("keeps a well-formed reminder stripped but stops before a malformed one that follows it", () => {
+    const text = "<system-reminder>ok</system-reminder>\n<system-reminder>never closes";
+    expect(stripLeadingSystemReminders(text)).toBe("<system-reminder>never closes");
+  });
+
+  it("treats a tag with the wrong exact spelling as ordinary text, not a reminder to strip", () => {
+    const text = "<system-reminder >not the exact open tag</system-reminder>\nafter";
+    expect(stripLeadingSystemReminders(text)).toBe(text);
+  });
+
+  it("never throws and returns the empty string for empty input", () => {
+    expect(stripLeadingSystemReminders("")).toBe("");
+  });
+});
+
+describe("promptCacheKeyFor (B1)", () => {
+  it("gives distinct prompts distinct keys", () => {
+    const a = promptCacheKeyFor([{ role: "user", content: "please review pull request 42" }]);
+    const b = promptCacheKeyFor([{ role: "user", content: "please review pull request 99" }]);
+    expect(a).not.toBe(b);
+    expect(a).toMatch(/^[0-9a-f]{24}$/);
+  });
+
+  it('returns "anon" when there is no user message', () => {
+    expect(promptCacheKeyFor([{ role: "assistant", content: "hi" }])).toBe("anon");
+    expect(promptCacheKeyFor([])).toBe("anon");
+  });
+
+  it("does not let a 20,124-byte common reminder swallow conversation-specific text", () => {
+    // This is the exact measured shape from work order section 4: a large identical
+    // <system-reminder> (the global CLAUDE.md) in front of every first user message on a host.
+    const reminderBody = "x".repeat(20_124);
+    const wrap = (tail: string) => `<system-reminder>${reminderBody}</system-reminder>\n${tail}`;
+    const convoA: AnthropicMessage[] = [{ role: "user", content: wrap("conversation A specific text") }];
+    const convoB: AnthropicMessage[] = [{ role: "user", content: wrap("conversation B specific text") }];
+
+    // OLD BUG: conversationKey truncates to 4096 chars before the reminder even ends, so
+    // both conversations hash identically. This assertion would have PASSED before the fix
+    // too (it documents the bug, not the fix) -- the next assertion is the one that would
+    // have FAILED against the old code.
+    expect(conversationKey(convoA)).toBe(conversationKey(convoB));
+    // FIXED: the reminder is stripped entirely and the full (untruncated) tail is hashed.
+    expect(promptCacheKeyFor(convoA)).not.toBe(promptCacheKeyFor(convoB));
+  });
+
+  it("regression: the old 4096-char truncation no longer hides a differing suffix", () => {
+    const prefix = "x".repeat(5000); // longer than the old 4096-char slice, no reminder involved
+    const convoA: AnthropicMessage[] = [{ role: "user", content: `${prefix}AAA tail` }];
+    const convoB: AnthropicMessage[] = [{ role: "user", content: `${prefix}BBB tail` }];
+
+    // Would have passed before the fix too -- proves the shared prefix is long enough to
+    // trigger the bug in the legacy key.
+    expect(conversationKey(convoA)).toBe(conversationKey(convoB));
+    // Would have FAILED before the fix: promptCacheKeyFor now hashes past the 4096-char mark.
+    expect(promptCacheKeyFor(convoA)).not.toBe(promptCacheKeyFor(convoB));
+  });
+
+  it("strips multiple leading reminder blocks before hashing", () => {
+    const build = (tail: string) =>
+      `<system-reminder>one</system-reminder>\n\n<system-reminder>two</system-reminder>\n${tail}`;
+    const a = promptCacheKeyFor([{ role: "user", content: build("real prompt A") }]);
+    const b = promptCacheKeyFor([{ role: "user", content: build("real prompt B") }]);
+    expect(a).not.toBe(b);
+    expect(stripLeadingSystemReminders(build("real prompt A"))).toBe("real prompt A");
+  });
+
+  it("falls back to hashing the raw text when the stripped remainder is empty", () => {
+    const onlyReminder = `<system-reminder>${"y".repeat(500)}</system-reminder>`;
+    expect(stripLeadingSystemReminders(onlyReminder)).toBe("");
+
+    const key = promptCacheKeyFor([{ role: "user", content: onlyReminder }]);
+    // Documents the exact fallback mechanism (hash of the RAW text), not just "it doesn't
+    // crash" -- two conversations whose entire first message is this same reminder text will
+    // legitimately collide on this key, which is the documented, accepted tradeoff.
+    expect(key).toBe(createHash("sha256").update(onlyReminder).digest("hex").slice(0, 24));
+    expect(promptCacheKeyFor([{ role: "user", content: onlyReminder }])).toBe(key);
+  });
+
+  it("deliberately collides identical fan-out prompts on the same key (affinity, not a bug)", () => {
+    const prompt = "Investigate the failing test and report back.";
+    const convoA: AnthropicMessage[] = [{ role: "user", content: prompt }];
+    const convoB: AnthropicMessage[] = [{ role: "user", content: prompt }];
+    expect(promptCacheKeyFor(convoA)).toBe(promptCacheKeyFor(convoB));
+  });
+
+  it("hashes a first user message given as content blocks the same way as an equivalent string", () => {
+    const reminder = "<system-reminder>global claude.md</system-reminder>";
+    const asString: AnthropicMessage[] = [{ role: "user", content: `${reminder}\nreal question` }];
+    const asBlocks: AnthropicMessage[] = [
+      { role: "user", content: [{ type: "text", text: `${reminder}\nreal question` }] },
+    ];
+    expect(promptCacheKeyFor(asBlocks)).toBe(promptCacheKeyFor(asString));
+  });
+});
+
+describe("firstUserHashDiagnostics (P0.4)", () => {
+  it("returns only hashes and lengths, never content", () => {
+    const reminder = `<system-reminder>${"z".repeat(300)}</system-reminder>`;
+    const diag = firstUserHashDiagnostics([{ role: "user", content: `${reminder}\nreal question` }]);
+    expect(Object.keys(diag).sort()).toEqual(["rawHash", "rawLen", "strippedHash", "strippedLen"]);
+    expect(diag.rawHash).toMatch(/^[0-9a-f]{12}$/);
+    expect(diag.strippedHash).toMatch(/^[0-9a-f]{12}$/);
+    expect(diag.rawLen).toBeGreaterThan(diag.strippedLen);
+    expect(diag.strippedLen).toBe("real question".length);
+  });
+
+  it("keeps the stripped hash stable even when the raw reminder wrapping differs", () => {
+    const a = firstUserHashDiagnostics([
+      { role: "user", content: `<system-reminder>${"a".repeat(200)}</system-reminder>\nsame question` },
+    ]);
+    const b = firstUserHashDiagnostics([
+      { role: "user", content: `<system-reminder>${"b".repeat(9000)}</system-reminder>\nsame question` },
+    ]);
+    expect(a.strippedHash).toBe(b.strippedHash);
+    expect(a.rawHash).not.toBe(b.rawHash);
+  });
+
+  it("handles no user message without throwing", () => {
+    const diag = firstUserHashDiagnostics([]);
+    expect(diag.rawLen).toBe(0);
+    expect(diag.strippedLen).toBe(0);
+  });
+});
+
+describe("threadIdFor", () => {
+  it("formats a 24-hex key into UUID shape unchanged", () => {
+    const key = promptCacheKeyFor([{ role: "user", content: "x" }]);
+    expect(threadIdFor(key)).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  });
+});
+
+describe("reasoningKeyForCallIds (B2)", () => {
+  it("returns null for an empty array", () => {
+    expect(reasoningKeyForCallIds([])).toBeNull();
+  });
+
+  it("returns null when every entry is falsy", () => {
+    expect(reasoningKeyForCallIds(["", undefined as unknown as string, null as unknown as string])).toBeNull();
+  });
+
+  it("is invariant to arrival order (out-of-order stream completion)", () => {
+    const inOrder = reasoningKeyForCallIds(["call_a", "call_b", "call_c"]);
+    const outOfOrder = reasoningKeyForCallIds(["call_c", "call_a", "call_b"]);
+    expect(inOrder).toBe(outOfOrder);
+    expect(inOrder).toMatch(/^[0-9a-f]{24}$/);
+  });
+
+  it("de-duplicates repeated call ids", () => {
+    expect(reasoningKeyForCallIds(["call_a", "call_a", "call_b"])).toBe(
+      reasoningKeyForCallIds(["call_a", "call_b"]),
+    );
+  });
+
+  it("distinguishes different call-id tuples", () => {
+    expect(reasoningKeyForCallIds(["call_a"])).not.toBe(reasoningKeyForCallIds(["call_b"]));
+  });
+});
+
+describe("B2 — reasoning cache keyed on tool-call id tuples (correctness)", () => {
+  const item = {
+    type: "reasoning" as const,
+    summary: [{ type: "summary_text" as const, text: "prior reasoning" }],
+    encrypted_content: "enc_1",
+  };
+  const otherItem = {
+    type: "reasoning" as const,
+    summary: [{ type: "summary_text" as const, text: "other conversation reasoning" }],
+    encrypted_content: "enc_2",
+  };
+
+  // Every test in this block gets its own fresh module instance so cache/TTL state from one
+  // test (and from other test FILES importing the same singleton module) can never leak into
+  // another -- mirrors the loadReasoningCache pattern already used for this module elsewhere.
+  async function loadCache(ttlMs?: string) {
+    vi.resetModules();
+    if (ttlMs === undefined) delete process.env.CCX_REASONING_TTL_MS;
+    else process.env.CCX_REASONING_TTL_MS = ttlMs;
+    return import("../adapters/codex-reasoning-cache.js");
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-05T12:00:00Z"));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+    delete process.env.CCX_REASONING_TTL_MS;
+  });
+
+  it("gives two simultaneous, identically-prompted conversations independent reasoning slots", async () => {
+    const { reasoningKeyForCallIds, reasoningItemsByKey, setReasoningItemsByKey } = await loadCache();
+    // Under the OLD first-user-text keying, convoA and convoB (identical prompts) would share
+    // ONE key -- the measured bug from work order section 4 ("only one key ... was ever
+    // observed"). This test would have failed against that scheme: both lookups below would
+    // have returned whichever conversation wrote last.
+    const keyA = reasoningKeyForCallIds(["callA_1"]);
+    const keyB = reasoningKeyForCallIds(["callB_1"]);
+    expect(keyA).not.toBe(keyB);
+
+    setReasoningItemsByKey(keyA!, [item]);
+    setReasoningItemsByKey(keyB!, [otherItem]);
+
+    expect(reasoningItemsByKey(keyA!)).toEqual([item]);
+    expect(reasoningItemsByKey(keyB!)).toEqual([otherItem]);
+  });
+
+  it("derives the same key regardless of the order call ids complete in", async () => {
+    const { reasoningKeyForCallIds, reasoningItemsByKey, setReasoningItemsByKey } = await loadCache();
+    const keyInOrder = reasoningKeyForCallIds(["call_1", "call_2"]);
+    setReasoningItemsByKey(keyInOrder!, [item]);
+
+    const keyOutOfOrder = reasoningKeyForCallIds(["call_2", "call_1"]);
+    expect(keyOutOfOrder).toBe(keyInOrder);
+    expect(reasoningItemsByKey(keyOutOfOrder!)).toEqual([item]);
+  });
+
+  it("keys correctly on a turn with multiple tool calls", async () => {
+    const { reasoningKeyForCallIds, reasoningItemsByKey, setReasoningItemsByKey } = await loadCache();
+    const key = reasoningKeyForCallIds(["call_1", "call_2", "call_3"]);
+    setReasoningItemsByKey(key!, [item]);
+    expect(reasoningItemsByKey(reasoningKeyForCallIds(["call_1", "call_2", "call_3"])!)).toEqual([item]);
+  });
+
+  it("gives a text-only assistant turn no key at all, so the caller must skip reuse rather than guess", async () => {
+    const { reasoningKeyForCallIds } = await loadCache();
+    // An assistant turn with no tool_use block reduces to an empty call-id tuple (see
+    // lastAssistantToolCallIds in codex-oauth.ts). Hashing the empty string here would create a
+    // shared "no id" key that a later text-only turn from a DIFFERENT conversation could also
+    // land on -- quietly recreating the exact cross-conversation collision B2 fixes.
+    expect(reasoningKeyForCallIds([])).toBeNull();
+  });
+
+  it("stale-write fix: a turn with no new reasoning clears the previous turn's blobs", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { reasoningKeyForCallIds, reasoningItemsByKey, setReasoningItemsByKey } = await loadCache();
+    const key = reasoningKeyForCallIds(["call_1"])!;
+    setReasoningItemsByKey(key, [item]);
+    expect(reasoningItemsByKey(key)).toEqual([item]);
+
+    // Before the fix, setReasoningItems only wrote `if (items.length)`, so this call
+    // (representing a turn that produced no reasoning) would have been skipped and the
+    // assertion below would have wrongly still seen [item].
+    setReasoningItemsByKey(key, []);
+    expect(reasoningItemsByKey(key)).toEqual([]);
+    // And this must be an explicit overwrite, not a coincidental TTL lapse producing the same
+    // empty result -- a lapse would have logged LAPSED/EVICTED, an explicit write does not.
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it("expires reasoning after the configured TTL", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { reasoningKeyForCallIds, reasoningItemsByKey, setReasoningItemsByKey } = await loadCache("60000");
+    const key = reasoningKeyForCallIds(["call_ttl"])!;
+    setReasoningItemsByKey(key, [item]);
+    vi.advanceTimersByTime(60_001);
+
+    expect(reasoningItemsByKey(key)).toEqual([]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("reasoning-cache LAPSED"));
+  });
+
+  it("a resumed transcript still finds its reasoning if it comes back inside the TTL window", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const { reasoningKeyForCallIds, reasoningItemsByKey, setReasoningItemsByKey } = await loadCache();
+    const key = reasoningKeyForCallIds(["call_resume"])!;
+    setReasoningItemsByKey(key, [item]);
+    // 35 minutes idle: past the old 30-minute TTL this cache used to run, comfortably inside
+    // the current 4-hour default. A resumed session recomputes the same key from the same last
+    // assistant turn's call ids, so the lookup must still succeed.
+    vi.advanceTimersByTime(35 * 60 * 1000);
+
+    expect(reasoningItemsByKey(reasoningKeyForCallIds(["call_resume"])!)).toEqual([item]);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("reasoning-cache RESCUED"));
+  });
+
+  it("threadIdFor is pure: repeated calls cannot create cache entries that evict others", async () => {
+    const { reasoningKeyForCallIds, reasoningItemsByKey, setReasoningItemsByKey, threadIdFor: threadIdForFresh } =
+      await loadCache();
+    const survivorKey = reasoningKeyForCallIds(["survivor-call"])!;
+    setReasoningItemsByKey(survivorKey, [item]);
+
+    // Formatting 300 distinct thread ids -- well past the 256-entry live cache cap -- must not
+    // touch the cache map at all. Before this change, threadIdFor lazily created a
+    // reasoning-cache entry as a side effect and could evict others doing so; if that side
+    // effect still existed, this loop alone would be enough to evict `survivorKey`.
+    for (let i = 0; i < 300; i++) threadIdForFresh(`${i}`.padStart(24, "0"));
+
+    expect(reasoningItemsByKey(survivorKey)).toEqual([item]);
+  });
+});
+
+describe("isPromptCacheKeyV2Enabled (work order item 2 — B1 default flip)", () => {
+  const ORIGINAL = process.env.CCX_PROMPT_CACHE_KEY_V2;
+  afterEach(() => {
+    if (ORIGINAL === undefined) delete process.env.CCX_PROMPT_CACHE_KEY_V2;
+    else process.env.CCX_PROMPT_CACHE_KEY_V2 = ORIGINAL;
+  });
+
+  it("defaults to enabled (true) when the env var is unset -- the NEW default", () => {
+    // Before the item-2 flip this read `=== "1"` only, defaulting OFF. This assertion would
+    // have FAILED against that code with the env var unset (it would have returned false).
+    delete process.env.CCX_PROMPT_CACHE_KEY_V2;
+    expect(isPromptCacheKeyV2Enabled()).toBe(true);
+  });
+
+  it.each(["0", "false", "off", "FALSE", "OFF"])("treats %s as an explicit opt-out", (value) => {
+    process.env.CCX_PROMPT_CACHE_KEY_V2 = value;
+    // Before the flip, every one of these values (not just "1") already read as OFF, so only
+    // the case-insensitivity half of this assertion is new; paired with the "unset" test above,
+    // together they are what distinguishes the new default from the old one.
+    expect(isPromptCacheKeyV2Enabled()).toBe(false);
+  });
+
+  it("treats any other value, including the old canary spelling, as enabled", () => {
+    process.env.CCX_PROMPT_CACHE_KEY_V2 = "1";
+    expect(isPromptCacheKeyV2Enabled()).toBe(true);
+    process.env.CCX_PROMPT_CACHE_KEY_V2 = "yes";
+    expect(isPromptCacheKeyV2Enabled()).toBe(true);
+  });
+
+  it("both the legacy and v2 candidate keys stay computable regardless of which one the gate selects", () => {
+    // The gate only decides SELECTION at the call site; both candidates must remain computable
+    // so p0-correlate can keep logging both for comparison after the promotion, exactly as it
+    // did during the canary (work order item 2: "Keep computing and logging BOTH ... exactly
+    // as now").
+    const messages: AnthropicMessage[] = [{ role: "user", content: "distinguishing text" }];
+    expect(conversationKey(messages)).toMatch(/^[0-9a-f]{24}$/);
+    expect(promptCacheKeyFor(messages)).toMatch(/^[0-9a-f]{24}$/);
+  });
+});
+
+describe("normalizeCchForWire (Fix A, work order item 1 — narrow wire normalizer)", () => {
+  const CC_PROMPT_ID = "550e8400-e29b-41d4-a716-446655440000";
+  const METADATA_LINE = `env: cc_version=2.1.261.2ad; cc_entrypoint=claude-vscode; cch=3ad2c; cc_is_subagent=true; cc_prompt_id=${CC_PROMPT_ID};`;
+  const SYSTEM_TAIL = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+  it("replaces the single cch field with a fixed-width constant, leaving length and every other field byte-identical", () => {
+    const instructions = `${METADATA_LINE}\n${SYSTEM_TAIL}`;
+    const out = normalizeCchForWire(instructions);
+    expect(out).not.toBe(instructions);
+    // Same width as the replaced 5-hex-char value, so systemChars stays comparable whether or
+    // not the flag is on -- this is the property that lets the raw and normalized instruction
+    // lengths be compared directly in the trace.
+    expect(out.length).toBe(instructions.length);
+    expect(out).toContain("cch=00000");
+    expect(out).not.toContain("cch=3ad2c");
+    // version/entrypoint/subagent/cc_prompt_id untouched.
+    expect(out).toContain("cc_version=2.1.261.2ad;");
+    expect(out).toContain("cc_entrypoint=claude-vscode;");
+    expect(out).toContain("cc_is_subagent=true;");
+    expect(out).toContain(`cc_prompt_id=${CC_PROMPT_ID};`);
+    // Everything after the metadata line -- all user/system-authored text -- passes through
+    // byte-identical.
+    expect(out.endsWith(`\n${SYSTEM_TAIL}`)).toBe(true);
+  });
+
+  it("does NOT touch a lookalike cch=... occurring in user-authored text elsewhere in the system prompt", () => {
+    // This is the test that distinguishes this narrow, line-scoped normalizer from the existing
+    // diagnostic cchNormalizedHash, which does a GLOBAL replace over the whole instructions
+    // string. Reusing that regex here (or widening this function's replace to the whole string)
+    // would make this assertion fail: the lookalike below would get rewritten too.
+    const userText = "For reference, the old config used the literal key cch=abcde in one place.";
+    const instructions = `${METADATA_LINE}\n${userText}\n${SYSTEM_TAIL}`;
+    const out = normalizeCchForWire(instructions);
+    expect(out).toContain("cch=abcde"); // untouched, even though it matches the same shape
+    expect(out).toContain("cch=00000"); // the metadata line's OWN cch was still replaced
+    expect(out).not.toContain("cch=3ad2c");
+  });
+
+  it("returns the input completely unchanged when no recognized metadata line is present", () => {
+    // A `cch=`-shaped substring can still appear on its own (no cc_version/cc_prompt_id on the
+    // same line) -- this must not be mistaken for the metadata line.
+    const instructions = `${SYSTEM_TAIL}\nSome unrelated system text mentioning cch=12345 in passing.`;
+    expect(normalizeCchForWire(instructions)).toBe(instructions);
+  });
+
+  it("logs the UNEXPECTED-count warning ONCE PER PROCESS and leaves instructions unchanged for both a zero-cch and a two-cch metadata line", () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const zeroCchLine = `env: cc_version=2.1.261.2ad; cc_entrypoint=claude-vscode; cc_is_subagent=true; cc_prompt_id=${CC_PROMPT_ID};`;
+    const zeroInstructions = `${zeroCchLine}\n${SYSTEM_TAIL}`;
+    // A format change must surface, never silently restore the old (unnormalized) behaviour --
+    // this is the "return input unchanged" half of that contract.
+    expect(normalizeCchForWire(zeroInstructions)).toBe(zeroInstructions);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("[codex] cch-normalize UNEXPECTED count=0"));
+    log.mockClear();
+
+    const twoCchLine = `env: cc_version=2.1.261.2ad; cch=3ad2c; cc_entrypoint=claude-vscode; cch=99999; cc_is_subagent=true; cc_prompt_id=${CC_PROMPT_ID};`;
+    const twoInstructions = `${twoCchLine}\n${SYSTEM_TAIL}`;
+    expect(normalizeCchForWire(twoInstructions)).toBe(twoInstructions);
+    // The requirement is explicitly "once per PROCESS, not once per request": a second,
+    // differently-malformed call must NOT log again. A once-per-request implementation (e.g. a
+    // flag keyed by content, or no flag at all) would have logged here too.
+    expect(log).not.toHaveBeenCalled();
+
+    log.mockRestore();
+  });
+});
+
+describe("cchNormalizedForWire (Fix A flag gate, work order item 1)", () => {
+  const ORIGINAL = process.env.CCX_NORMALIZE_CCH;
+  afterEach(() => {
+    if (ORIGINAL === undefined) delete process.env.CCX_NORMALIZE_CCH;
+    else process.env.CCX_NORMALIZE_CCH = ORIGINAL;
+  });
+
+  const instructions =
+    "env: cc_version=2.1.261.2ad; cc_entrypoint=claude-vscode; cch=3ad2c; cc_is_subagent=true; cc_prompt_id=550e8400-e29b-41d4-a716-446655440000;\nYou are Claude Code, Anthropic's official CLI for Claude.";
+
+  it("defaults OFF: with the env var unset, outgoing instructions pass through byte-identical", () => {
+    delete process.env.CCX_NORMALIZE_CCH;
+    const result = cchNormalizedForWire(instructions);
+    expect(result.sent).toBe(instructions);
+    expect(result.normalized).toBe(false);
+  });
+
+  it("normalizes only when CCX_NORMALIZE_CCH=1, and reports normalized=true only when a replacement actually happened", () => {
+    process.env.CCX_NORMALIZE_CCH = "1";
+    const result = cchNormalizedForWire(instructions);
+    expect(result.sent).not.toBe(instructions);
+    expect(result.sent).toContain("cch=00000");
+    expect(result.normalized).toBe(true);
+  });
+
+  it("any other value than the literal \"1\" leaves the gate off", () => {
+    process.env.CCX_NORMALIZE_CCH = "true";
+    const result = cchNormalizedForWire(instructions);
+    expect(result.sent).toBe(instructions);
+    expect(result.normalized).toBe(false);
+  });
+});
+
+describe("diffBlockSignatures (work order item 3 — CHANGED-SIZE vs CHANGED-CONTENT)", () => {
+  const sig = (index: number, len: number, hash: string): SystemBlockSignature => ({
+    index,
+    type: "text",
+    len,
+    hash,
+  });
+
+  it("labels a same-length, different-hash block CHANGED-CONTENT, not CHANGED-SIZE", () => {
+    // The exact live-trace shape from work order item 3: lenPrev=153 lenNow=153, only the hash
+    // moved. Before this change the code emitted CHANGED-SIZE unconditionally whenever a
+    // block's hash differed, so this assertion would have FAILED (seen "CHANGED-SIZE ...").
+    const prev = [sig(0, 153, "477654caa0c6")];
+    const curr = [sig(0, 153, "495a782a600a")];
+    const changes = diffBlockSignatures(prev, curr);
+    expect(changes).toHaveLength(1);
+    expect(changes[0]).toMatch(/^CHANGED-CONTENT /);
+    expect(changes[0]).not.toMatch(/^CHANGED-SIZE /);
+  });
+
+  it("still labels a genuinely different-length block CHANGED-SIZE", () => {
+    const prev = [sig(0, 153, "aaaaaaaaaaaa")];
+    const curr = [sig(0, 200, "bbbbbbbbbbbb")];
+    const changes = diffBlockSignatures(prev, curr);
+    expect(changes).toHaveLength(1);
+    expect(changes[0]).toMatch(/^CHANGED-SIZE /);
+  });
+});
+
+describe("codexSessionHeadersEnabled (prompt-cache affinity headers, exp3 2026-09-06)", () => {
+  const ORIGINAL = process.env.CCX_CODEX_SESSION_HEADERS;
+  afterEach(() => {
+    if (ORIGINAL === undefined) delete process.env.CCX_CODEX_SESSION_HEADERS;
+    else process.env.CCX_CODEX_SESSION_HEADERS = ORIGINAL;
+  });
+
+  it("defaults to enabled when the env var is unset", () => {
+    // Measured on the rig: without conversation_id/session_id six byte-identical sequential
+    // requests on one prompt_cache_key read 3712, 44672, 5760, 44672, 5760, 44672; with them
+    // the same sequence read 12928 then 44672 x5. Default-on is the measured-safe setting.
+    delete process.env.CCX_CODEX_SESSION_HEADERS;
+    expect(codexSessionHeadersEnabled()).toBe(true);
+  });
+
+  it.each(["0", "false", "off", "OFF"])("treats %s as an explicit opt-out", (value) => {
+    process.env.CCX_CODEX_SESSION_HEADERS = value;
+    expect(codexSessionHeadersEnabled()).toBe(false);
+  });
+
+  it("treats any other value as enabled", () => {
+    process.env.CCX_CODEX_SESSION_HEADERS = "1";
+    expect(codexSessionHeadersEnabled()).toBe(true);
+  });
+});

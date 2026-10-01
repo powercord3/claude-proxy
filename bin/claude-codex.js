@@ -107,9 +107,9 @@ async function main() {
   // GPT-5.6 family: Sol (frontier) / Terra (balanced) / Luna (fast). Switch with /model.
   console.log("  Models: GPT-5.6 family  (372k context window)");
   console.log("  ─────────────────────────────────────────────");
-  console.log("    /model sol       gpt-5.6-sol    Frontier — hardest coding (default · High effort)");
+  console.log("    /model sol       gpt-6-sol      Frontier — hardest coding (default · High effort)");
   console.log("    /model terra     gpt-5.6-terra  Balanced — everyday high-volume work");
-  console.log("    /model luna      gpt-5.6-luna   Fast & affordable — routine tasks");
+  console.log("    /model luna      gpt-6-luna     Fast & affordable — routine tasks");
   console.log("    /model gpt55     gpt-5.5        Previous frontier (272k window)");
   console.log("");
   console.log("  Reasoning level (Sol shortcuts, or add @level to any model):");
@@ -148,7 +148,7 @@ async function main() {
   await launchProxy({
     rootDir,
     provider: "codex-oauth",
-    model: "gpt-5.6-sol",
+    model: "gpt-6-sol",
     defaultModel: "codex",
     startedBy: "claude-codex",
     forceRestart: args.includes("--restart"),
