@@ -509,6 +509,8 @@ fastify.post("/v1/messages", async (req, res) => {
     // web tools and inject a system prompt telling the model to use its own search.
     // Claude Code's WebSearch runs locally and won't work through the proxy.
     const hasNativeSearch = ["codex-oauth", "openai", "gemini-oauth", "gemini"].includes(provider);
+    const benchNoServerWeb = bench !== undefined;
+    const codexOpts = benchNoServerWeb ? { serverWebSearch: false } : undefined;
     if (hasNativeSearch) {
       // P0.1 - capture the INBOUND system representation before applyNativeSearchSubstitution
       // mutates it (it appends a fixed 445-char searchNote to the end for codex - constant,
@@ -551,7 +553,9 @@ fastify.post("/v1/messages", async (req, res) => {
       } catch (err) {
         console.log(`[codex] p0-system error=${err instanceof Error ? err.message : String(err)}`);
       }
-      applyNativeSearchSubstitution(body, provider);
+      // Bench traffic (any /bench/ prefix, tagged or not) gets no server web: the codex
+      // adapter omits the hosted web_search tool, and the note advertising it is not added.
+      applyNativeSearchSubstitution(body, provider, { note: !benchNoServerWeb });
     }
 
     // Don't let internal Claude Code requests (haiku for titles, etc.) override the user's active model
@@ -619,7 +623,7 @@ fastify.post("/v1/messages", async (req, res) => {
       if (!key) {
         throw apiError(401, "OPENAI_API_KEY not set in ~/.claude-proxy/.env");
       }
-      return await runStreaming((r) => chatCodexOAuth(r, body, model, key, reasoning, serviceTier, codexFallbackArmed));
+      return await runStreaming((r) => chatCodexOAuth(r, body, model, key, reasoning, serviceTier, codexFallbackArmed, codexOpts));
     }
 
     if (provider === "openrouter") {
@@ -647,7 +651,7 @@ fastify.post("/v1/messages", async (req, res) => {
     }
 
     if (provider === "codex-oauth") {
-      return await runStreaming((r) => chatCodexOAuth(r, body, model, undefined, reasoning, serviceTier, codexFallbackArmed));
+      return await runStreaming((r) => chatCodexOAuth(r, body, model, undefined, reasoning, serviceTier, codexFallbackArmed, codexOpts));
     }
 
     if (provider === "gemini") {

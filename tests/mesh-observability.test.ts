@@ -296,6 +296,21 @@ describe("native web search substitution", () => {
     expect(log).not.toHaveBeenCalled();
   });
 
+  it("note:false (bench) still strips the client web tools but does not advertise server search", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const { applyNativeSearchSubstitution, searchNote } = await import("../adapters/web-search-substitution.js");
+    const req = {
+      model: "x", messages: [], system: "base",
+      tools: [{ name: "WebSearch" }, { name: "Bash" }],
+    } as unknown as AnthropicRequest;
+    applyNativeSearchSubstitution(req, "codex-oauth", { note: false });
+    expect(req.tools?.map((tool) => tool.name)).toEqual(["Bash"]);
+    expect(req.system).toBe("base");
+    const normal = { model: "x", messages: [], system: "base" } as unknown as AnthropicRequest;
+    applyNativeSearchSubstitution(normal, "codex-oauth");
+    expect(normal.system).toBe("base" + searchNote);
+  });
+
   it("logs the strip notice once per provider, not once per turn", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     const { applyNativeSearchSubstitution, __resetSubstitutionLogState } = await import("../adapters/web-search-substitution.js");

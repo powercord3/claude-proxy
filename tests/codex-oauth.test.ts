@@ -870,3 +870,45 @@ describe("Fix A wiring — CCX_NORMALIZE_CCH (work order section 6)", () => {
     vi.unstubAllGlobals();
   });
 });
+
+// Bench holdout contamination (2026-10-08): the hosted web_search tool is what the model calls
+// `web.run`, and the backend runs it server-side, past any local firewall. A bench request must
+// reach the wire with no server tool at all; every other request keeps it.
+describe("server web search on the wire", () => {
+  it("is sent by default and withheld when serverWebSearch is false", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { chatCodexOAuth } = await import("../adapters/providers/codex-oauth.js");
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      body: new ReadableStream({ start(c) { c.close(); } }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const body = () =>
+      ({
+        model: "codex",
+        tools: [{ name: "Read", description: "r", input_schema: { type: "object", properties: {} } }],
+        messages: [{ role: "user", content: "hi" }],
+      }) as unknown as import("../adapters/types.js").AnthropicRequest;
+    const fakeReply = {
+      raw: { write: () => {}, end: () => {}, writableEnded: false },
+    } as unknown as import("fastify").FastifyReply;
+    const sentTools = (call: number) =>
+      JSON.parse((fetchMock.mock.calls[call][1] as RequestInit).body as string).tools;
+    try {
+      await chatCodexOAuth(fakeReply, body(), "gpt-5.6-sol", "test-key");
+      await chatCodexOAuth(fakeReply, body(), "gpt-5.6-sol", "test-key", undefined, undefined, undefined, { serverWebSearch: false });
+      expect(sentTools(0).map((t: any) => t.type)).toEqual(["function", "web_search"]);
+      expect(sentTools(1).map((t: any) => t.type)).toEqual(["function"]);
+      expect(sentTools(1)[0].name).toBe("Read");
+    } finally {
+      vi.restoreAllMocks();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("toResponsesTools omits only web_search when webSearch is false", () => {
+    expect(toResponsesTools(undefined, { webSearch: false })).toEqual([]);
+  });
+});

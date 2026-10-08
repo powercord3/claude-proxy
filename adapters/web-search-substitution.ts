@@ -12,7 +12,11 @@ export function __resetSubstitutionLogState() {
   loggedProviders.clear();
 }
 
-export function applyNativeSearchSubstitution(body: AnthropicRequest, provider: string) {
+export function applyNativeSearchSubstitution(
+  body: AnthropicRequest,
+  provider: string,
+  opts: { note?: boolean } = {},
+) {
   const removed = (body.tools ?? [])
     .filter((t) => t.name === "WebSearch" || t.name === "WebFetch")
     .map((t) => t.name);
@@ -24,6 +28,8 @@ export function applyNativeSearchSubstitution(body: AnthropicRequest, provider: 
     console.log(`[ccx] web tools stripped for ${provider}: ${removed.join(",")} - native search substituted; logged once per lane per process${removed.includes("WebFetch") ? "; WebFetch has NO equivalent" : ""}`);
   }
 
+  // note:false (bench traffic) - the lane's server search is withheld, so do not advertise it.
+  if (opts.note === false) return;
   if (Array.isArray(body.system)) {
     body.system = [...body.system, { type: "text", text: searchNote }];
   } else if (body.system) {

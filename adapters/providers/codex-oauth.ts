@@ -164,7 +164,21 @@ export function inspectToolSchema(schema: unknown): { constructs: string[]; maxD
   return { constructs: [...found].sort(), maxDepth };
 }
 
-export function toResponsesTools(tools: AnthropicTool[] | undefined): ResponsesTool[] {
+export interface CodexRequestOptions {
+  /**
+   * false = do not append the hosted `web_search` tool. The model sees that tool as `web.run`
+   * (search, open URL, finance, sports...) and the backend executes it server-side, so no local
+   * firewall can block it. The gateway sets false for every /bench/ request: a scored bench
+   * session must not be able to look up outcomes. Measured 2026-10-08 (scripts/probe-server-web.ts):
+   * with it the model lists web.run and fetches example.com; without it the model lists no tools.
+   */
+  serverWebSearch?: boolean;
+}
+
+export function toResponsesTools(
+  tools: AnthropicTool[] | undefined,
+  opts: { webSearch?: boolean } = {},
+): ResponsesTool[] {
   const out: ResponsesTool[] = [];
   if (tools) {
     for (const t of tools) {
@@ -186,8 +200,9 @@ export function toResponsesTools(tools: AnthropicTool[] | undefined): ResponsesT
     }
   }
   // Codex CLI registers native web_search; Claude Code's WebSearch/WebFetch are stripped
-  // upstream in anthropic-gateway.ts before they reach us.
-  out.push({ type: "web_search" });
+  // upstream in anthropic-gateway.ts before they reach us. Omitted when the caller turns
+  // server web off (bench traffic; see CodexRequestOptions).
+  if (opts.webSearch !== false) out.push({ type: "web_search" });
   return out;
 }
 
@@ -888,9 +903,10 @@ export async function chatCodexOAuth(
    * has started it returns false and the error is surfaced in-stream exactly as before.
    */
   fallbackArmed?: () => boolean,
+  opts?: CodexRequestOptions,
 ) {
   try {
-    await chatCodexOAuthInner(res, body, model, apiKey, reasoning, serviceTier);
+    await chatCodexOAuthInner(res, body, model, apiKey, reasoning, serviceTier, opts);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[codex] ERROR: ${message}`);
@@ -987,6 +1003,7 @@ async function chatCodexOAuthInner(
   apiKey?: string,
   reasoning?: ReasoningLevel,
   serviceTier?: ServiceTier,
+  opts?: CodexRequestOptions,
 ) {
   const isOAuth = !apiKey;
   // "openai" and "codex-oauth" are two different aliases over the same adapter (API key vs
@@ -1045,7 +1062,7 @@ async function chatCodexOAuthInner(
   // still goes through the reordered messages exactly as before; `inputForWs` is now built by
   // the same function that builds `input`, so the two can never drift apart again silently.
   const { httpInput: input, wsInput: inputForWs } = buildResponsesInputs(body.messages, cachedReasoning);
-  const tools = toResponsesTools(body.tools);
+  const tools = toResponsesTools(body.tools, { webSearch: opts?.serverWebSearch !== false });
   const verbosity = textVerbosity();
   const summary = reasoningSummary();
   const instructions = flattenSystem(body.system);
@@ -1251,7 +1268,7 @@ async function chatCodexOAuthInner(
   const textOnlyAssistantTurns = countTextOnlyAssistantTurns(messages);
 
   console.log(
-    `[codex] ${isOAuth ? "ChatGPT" : "API"} | model="${model}" messages=${messages.length} systemChars=${instructions.length} items=${input.length} tools=${tools.length} reasoning=${effectiveEffort}${tierApplied ? ` service_tier=${serviceTier}` : ""}${isCompaction ? " compaction=1" : ""} cache=${cachedReasoning.length}${reasoningCacheDisabled ? " cacheDisabled=1" : ""}${reasoningReuseSkipped ? " reasoningReuseSkipped=1" : ""} movedTrailingDeveloper=${trailingDeveloperMoved} reqKiB=${(reqJson.length / 1024).toFixed(1)} reasoningItems=${reasoningInputCount} fnCalls=${functionCallCount} fnOutputs=${functionOutputCount} textOnlyAssistantTurns=${textOnlyAssistantTurns} last=${JSON.stringify(lastInput)}`,
+    `[codex] ${isOAuth ? "ChatGPT" : "API"} | model="${model}" messages=${messages.length} systemChars=${instructions.length} items=${input.length} tools=${tools.length}${opts?.serverWebSearch === false ? " serverWeb=off" : ""} reasoning=${effectiveEffort}${tierApplied ? ` service_tier=${serviceTier}` : ""}${isCompaction ? " compaction=1" : ""} cache=${cachedReasoning.length}${reasoningCacheDisabled ? " cacheDisabled=1" : ""}${reasoningReuseSkipped ? " reasoningReuseSkipped=1" : ""} movedTrailingDeveloper=${trailingDeveloperMoved} reqKiB=${(reqJson.length / 1024).toFixed(1)} reasoningItems=${reasoningInputCount} fnCalls=${functionCallCount} fnOutputs=${functionOutputCount} textOnlyAssistantTurns=${textOnlyAssistantTurns} last=${JSON.stringify(lastInput)}`,
   );
 
   // P0.5: carried through to finalize() so the correlate line can join request-side state
