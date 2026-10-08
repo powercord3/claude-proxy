@@ -46,7 +46,7 @@ type PassArgs = {
 // newer than this table than to want a guess, and a wrong guess fails the request outright -
 // so unknown means do nothing, the same rule strip-model.py follows for unparseable pins.
 const EFFORT_MODELS =
-  /^claude-(opus-5|fable-5|mythos-5|sonnet-5|opus-4-8|opus-4-7|opus-4-6|sonnet-4-6|opus-4-5)/;
+  /^claude-(opus-5|fable-5|mythos-5|sonnet-5|haiku-5|opus-4-8|opus-4-7|opus-4-6|sonnet-4-6|opus-4-5)/;
 const BUDGET_MODELS = /^claude-(haiku-4-5|sonnet-4-5|opus-4-1|opus-4-0|sonnet-4-0)/;
 
 // `xhigh` arrived with Opus 4.7, so on the 4.6/4.5 generation it is not a valid level; `max`

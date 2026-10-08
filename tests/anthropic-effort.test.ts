@@ -59,4 +59,14 @@ describe("applyReasoning: effort sanitisation on the skip path", () => {
     expect(body.output_config).toBeUndefined();
     expect(body.thinking?.type).toBe("enabled");
   });
+
+  // Haiku 5.5 (verified live 2026-10-07: output_config.effort accepted, max thinks, low
+  // does not) is effort-family, unlike haiku-4-5 -- before this it fell to `skip` and the
+  // @suffix was silently ignored.
+  it("routes claude-haiku-5-5 to effort, not the haiku-4-5 budget path", () => {
+    const body: any = { max_tokens: 8192 };
+    applyReasoning(body, "claude-haiku-5-5", "max" as any);
+    expect(body.output_config).toEqual({ effort: "max" });
+    expect(body.thinking?.budget_tokens).toBeUndefined();
+  });
 });
